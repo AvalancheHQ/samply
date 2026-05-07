@@ -9,6 +9,9 @@ description = "A command line profiler for macOS and Linux."
 repository = "https://github.com/mstange/samply/"
 readme = "README.md"
 
+[lib]
+doctest = false
+
 [dependencies]
 
 fxprof-processed-profile = { version = "0.8", path = "../fxprof-processed-profile" }
