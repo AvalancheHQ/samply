@@ -1,15 +1,17 @@
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::ExitStatus;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, unbounded};
 use fxprof_processed_profile::Profile;
 
 use super::error::SamplingError;
 use super::process_launcher::{
-    ExistingProcessRunner, MachError, ReceivedStuff, RootTaskRunner, TaskAccepter, TaskLauncher,
+    get_all_descendant_pids, task_for_pid_and_queue, ExistingProcessRunner, MachError,
+    ReceivedStuff, RootTaskRunner, TaskAccepter, TaskLauncher,
 };
 use super::sampler::{ProcessSpecificPath, Sampler, TaskInit, TaskInitOrShutdown};
 use super::time::get_monotonic_timestamp;
@@ -24,6 +26,9 @@ pub fn run(
 ) -> Result<(Profile, ExitStatus), MachError> {
     let mut task_accepter = TaskAccepter::new()?;
 
+    let (root_pid_tx, root_pid_rx) = bounded::<u32>(1);
+    let mut launch_mode = false;
+
     let mut root_task_runner: Box<dyn RootTaskRunner> = match recording_mode {
         RecordingMode::All => {
             eprintln!("Error: Profiling all processes is not supported on macOS.");
@@ -32,6 +37,7 @@ pub fn run(
         }
         RecordingMode::Pid(pid) => Box::new(ExistingProcessRunner::new(pid, &mut task_accepter)),
         RecordingMode::Launch(process_launch_props) => {
+            launch_mode = true;
             let ProcessLaunchProps {
                 mut env_vars,
                 command_name,
@@ -71,6 +77,8 @@ pub fn run(
                 )?
             };
 
+            let mut task_launcher = task_launcher;
+            task_launcher.set_root_pid_sender(root_pid_tx);
             Box::new(task_launcher)
         }
     };
@@ -82,8 +90,62 @@ pub fn run(
         sampler.run()
     });
 
+    // Shared "pids we've already registered a task for". The IPC accepter loop and the
+    // descendant poller both consult this to avoid registering the same pid twice when
+    // the dylib injection and the poller race (the dylib essentially always wins, but we
+    // still need to be defensive).
+    let seen_pids: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Descendant poller: catches processes whose ancestors stripped DYLD_INSERT_LIBRARIES
+    // (hardened binaries like /usr/bin/env, node, Electron). Only runs in launch mode.
+    // Polls proc_listpids recursively under the root pid; new pids get task_for_pid'd
+    // and pushed onto the accepter queue, mirroring --pid attach semantics. Stops after
+    // 5 seconds — long enough to catch the early hardened-exec chain but not so long
+    // that we burn CPU for the whole profile.
+    let (poll_stop_tx, poll_stop_rx) = bounded::<()>(1);
+    let poll_thread = if launch_mode {
+        let queue_handle = task_accepter.queue_handle();
+        let seen_pids = Arc::clone(&seen_pids);
+        let poll_interval_ms: u64 = std::env::var("SAMPLY_DESCENDANT_POLL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        Some(thread::spawn(move || {
+            let Ok(root_pid) = root_pid_rx.recv_timeout(Duration::from_secs(5)) else {
+                return;
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let interval = Duration::from_millis(poll_interval_ms);
+            while Instant::now() < deadline {
+                if poll_stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                for pid in get_all_descendant_pids(root_pid) {
+                    // Atomically claim the pid before doing task_for_pid; if the IPC path
+                    // already grabbed it, skip.
+                    if !seen_pids.lock().unwrap().insert(pid) {
+                        continue;
+                    }
+                    if !task_for_pid_and_queue(pid, &queue_handle, true) {
+                        // task_for_pid failed (process already exited, or missing
+                        // entitlements). Roll back the claim so another path could
+                        // retry. In practice this means leaving the pid out of the
+                        // tree this poll cycle.
+                        seen_pids.lock().unwrap().remove(&pid);
+                    }
+                }
+                thread::sleep(interval);
+            }
+        }))
+    } else {
+        drop(root_pid_rx);
+        None
+    };
+
     let (accepter_sender, accepter_receiver) = unbounded();
+    let accepter_thread_seen_pids = Arc::clone(&seen_pids);
     let accepter_thread = thread::spawn(move || {
+        let seen_pids = accepter_thread_seen_pids;
         // Loop while accepting messages from the spawned process tree.
 
         // A map of pids to channel senders, to notify existing tasks of Jitdump
@@ -100,6 +162,14 @@ pub fn run(
             match task_accepter.next_message(timeout) {
                 Ok(ReceivedStuff::AcceptedTask(accepted_task)) => {
                     let pid = accepted_task.get_id();
+                    let newly_seen = seen_pids.lock().unwrap().insert(pid);
+                    if !newly_seen {
+                        // The poller already registered this pid. Don't push a duplicate
+                        // task into the sampler, but still unblock the dylib-injected
+                        // child so it can run.
+                        accepted_task.start_execution();
+                        continue;
+                    }
                     let (path_sender, path_receiver) = unbounded();
                     let send_result = task_sender.send(TaskInitOrShutdown::TaskInit(TaskInit {
                         start_time_mono: get_monotonic_timestamp(),
@@ -177,6 +247,13 @@ pub fn run(
     // Run the root task: either launch or attach to existing pid
     let exit_status = root_task_runner.run_root_task()?;
 
+    // Stop the descendant poller before the accepter, so that any pids the poller
+    // pushed are drained by the accepter loop before it shuts down.
+    let _ = poll_stop_tx.send(());
+    if let Some(t) = poll_thread {
+        let _ = t.join();
+    }
+
     accepter_sender
         .send(())
         .expect("couldn't tell accepter thread to stop");
@@ -193,9 +270,10 @@ pub fn run(
         Err(SamplingError::CouldNotObtainRootTask) => {
             eprintln!("Profiling failed: Could not obtain the root task.");
             eprintln!();
-            eprintln!("On macOS, samply cannot profile system commands, such as the sleep command or system python. This is because system executables are signed in such a way that they block the DYLD_INSERT_LIBRARIES environment variable, which subverts samply's attempt to siphon out the mach task port of the process.");
+            eprintln!("On macOS, samply cannot profile system commands (sleep, system python, hardened binaries) because they strip DYLD_INSERT_LIBRARIES on exec.");
+            eprintln!("samply also attempted to attach to descendant processes via task_for_pid, but none became available within 5 seconds.");
             eprintln!();
-            eprintln!("Suggested remedy: You can profile any binaries that you've compiled yourself, or which are unsigned or locally-signed, such as anything installed by cargo install or by Homebrew.");
+            eprintln!("Suggested remedy: Run 'samply setup' to grant task_for_pid entitlements, or profile a binary you compiled yourself (cargo install, Homebrew, etc.).");
             std::process::exit(1)
         }
         Err(e) => {

@@ -6,8 +6,10 @@ use std::os::raw::{c_int, c_void};
 use std::os::unix::prelude::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crossbeam_channel::Sender;
 
 use flate2::write::GzDecoder;
 use mach2::port::{mach_port_t, MACH_PORT_NULL};
@@ -29,6 +31,7 @@ pub struct TaskLauncher {
     child_env: Vec<(OsString, OsString)>,
     iteration_count: u32,
     ignore_exit_code: bool,
+    root_pid_sender: Option<Sender<u32>>,
 }
 
 impl RootTaskRunner for TaskLauncher {
@@ -39,6 +42,9 @@ impl RootTaskRunner for TaskLauncher {
         let mut ctrl_c_receiver = CtrlC::observe_oneshot();
 
         let mut root_child = self.launch_child();
+        if let Some(tx) = self.root_pid_sender.take() {
+            let _ = tx.send(root_child.id());
+        }
         let mut exit_status = root_child.wait().expect("couldn't wait for child");
 
         for i in 2..=self.iteration_count {
@@ -93,7 +99,12 @@ impl TaskLauncher {
             child_env,
             iteration_count,
             ignore_exit_code,
+            root_pid_sender: None,
         })
+    }
+
+    pub fn set_root_pid_sender(&mut self, tx: Sender<u32>) {
+        self.root_pid_sender = Some(tx);
     }
 
     pub fn launch_child(&self) -> Child {
@@ -123,7 +134,7 @@ impl TaskLauncher {
 pub struct TaskAccepter {
     server: OsIpcMultiShotServer,
     added_env: Vec<(OsString, OsString)>,
-    queue: Vec<ReceivedStuff>,
+    queue: Arc<Mutex<Vec<ReceivedStuff>>>,
     _temp_dir: Arc<tempfile::TempDir>,
 }
 
@@ -165,7 +176,7 @@ impl TaskAccepter {
         Ok(TaskAccepter {
             server,
             added_env,
-            queue: vec![],
+            queue: Arc::new(Mutex::new(Vec::new())),
             _temp_dir: Arc::new(dir),
         })
     }
@@ -175,11 +186,15 @@ impl TaskAccepter {
     }
 
     pub fn queue_received_stuff(&mut self, rs: ReceivedStuff) {
-        self.queue.push(rs);
+        self.queue.lock().unwrap().push(rs);
+    }
+
+    pub fn queue_handle(&self) -> Arc<Mutex<Vec<ReceivedStuff>>> {
+        Arc::clone(&self.queue)
     }
 
     pub fn next_message(&mut self, timeout: Duration) -> Result<ReceivedStuff, MachError> {
-        if let Some(rs) = self.queue.pop() {
+        if let Some(rs) = self.queue.lock().unwrap().pop() {
             return Ok(rs);
         }
 
@@ -298,58 +313,67 @@ impl RootTaskRunner for ExistingProcessRunner {
     }
 }
 
-impl ExistingProcessRunner {
-    fn get_all_descendant_pids(pid: u32) -> Vec<u32> {
-        let mut descendants = Vec::new();
-        let mut queue = vec![pid];
+pub(super) fn get_all_descendant_pids(pid: u32) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    let mut queue = vec![pid];
 
-        while let Some(current_pid) = queue.pop() {
-            if let Some(child_pids) = find_child_processes(current_pid) {
-                for child_pid in child_pids {
-                    descendants.push(child_pid);
-                    queue.push(child_pid);
-                }
+    while let Some(current_pid) = queue.pop() {
+        if let Some(child_pids) = find_child_processes(current_pid) {
+            for child_pid in child_pids {
+                descendants.push(child_pid);
+                queue.push(child_pid);
             }
         }
-
-        descendants
     }
 
-    pub fn new(pid: u32, task_accepter: &mut TaskAccepter) -> ExistingProcessRunner {
-        let mut queue_pid = |pid, failure_is_ok| {
-            let task = unsafe {
-                let mut task = MACH_PORT_NULL;
-                let kr = task_for_pid(mach_task_self(), pid as i32, &mut task);
-                if kr != 0 {
-                    if failure_is_ok {
-                        eprintln!("Warning: task_for_pid for child task failed with error code {kr}. Ignoring child, it may have already exited.");
-                        return;
-                    }
+    descendants
+}
 
-                    eprintln!("Error: task_for_pid for target task failed with error code {kr}.");
-                    eprintln!(
-                        "Please run 'samply setup' in order to grant appropriate entitlements"
-                    );
-                    eprintln!("to the binary.");
-                    std::process::exit(1);
-                }
-                task_suspend(task);
-                task
-            };
-            task_accepter.queue_received_stuff(ReceivedStuff::AcceptedTask(AcceptedTask {
-                task,
-                pid,
-                sender_channel: None,
-            }));
-        };
+/// Acquire a task port for `pid`, suspend it, and push it onto the shared accepter queue.
+/// Returns true on success. Used by both --pid attach and the descendant poller.
+pub(super) fn task_for_pid_and_queue(
+    pid: u32,
+    queue: &Mutex<Vec<ReceivedStuff>>,
+    failure_is_ok: bool,
+) -> bool {
+    let task = unsafe {
+        let mut task = MACH_PORT_NULL;
+        let kr = task_for_pid(mach_task_self(), pid as i32, &mut task);
+        if kr != 0 {
+            if failure_is_ok {
+                return false;
+            }
+            eprintln!("Error: task_for_pid for target task failed with error code {kr}.");
+            eprintln!("Please run 'samply setup' in order to grant appropriate entitlements");
+            eprintln!("to the binary.");
+            std::process::exit(1);
+        }
+        task_suspend(task);
+        task
+    };
+    queue
+        .lock()
+        .unwrap()
+        .push(ReceivedStuff::AcceptedTask(AcceptedTask {
+            task,
+            pid,
+            sender_channel: None,
+        }));
+    true
+}
+
+impl ExistingProcessRunner {
+    pub fn new(pid: u32, task_accepter: &mut TaskAccepter) -> ExistingProcessRunner {
+        let queue = task_accepter.queue_handle();
 
         // always root pid first
-        queue_pid(pid, false);
+        task_for_pid_and_queue(pid, &queue, false);
 
         // find all its descendants recursively
-        let descendant_pids = Self::get_all_descendant_pids(pid);
-        for pid in descendant_pids {
-            queue_pid(pid, true);
+        for descendant_pid in get_all_descendant_pids(pid) {
+            if !task_for_pid_and_queue(descendant_pid, &queue, true) {
+                eprintln!("Warning: task_for_pid for child task {descendant_pid} failed. Ignoring child, it may have already exited.");
+            }
         }
 
         ExistingProcessRunner {
