@@ -231,6 +231,13 @@ impl JitCategoryManager {
         name: &str,
         profile: &mut Profile,
     ) -> (SubcategoryHandle, Option<JsFrame>) {
+        static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("SAMPLY_DISABLE_JIT_CLASSIFICATION").is_ok()
+        });
+        if *DISABLED {
+            return (self.generic_jit_category.get(profile).into(), None);
+        }
+
         if name == "BaselineInterpreter" || name.starts_with("BlinterpOp: ") {
             return (
                 self.baseline_interpreter_category.get(profile).into(),
