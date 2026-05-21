@@ -243,11 +243,11 @@ pub struct ServerArgs {
 #[derive(Debug, Args)]
 pub struct SymbolArgs {
     /// Extra directories containing symbol files
-    #[arg(long)]
+    #[arg(long, env = "SAMPLY_SYMBOL_DIR", value_delimiter = ',')]
     pub symbol_dir: Vec<PathBuf>,
 
     /// Additional URLs of symbol servers serving PDB / DLL / EXE files
-    #[arg(long)]
+    #[arg(long, env = "SAMPLY_WINDOWS_SYMBOL_SERVER", value_delimiter = ',')]
     pub windows_symbol_server: Vec<String>,
 
     /// Overrides the default cache directory for Windows symbol files which were downloaded from a symbol server
@@ -255,11 +255,11 @@ pub struct SymbolArgs {
     pub windows_symbol_cache: Option<PathBuf>,
 
     /// Additional URLs of symbol servers serving Breakpad .sym files
-    #[arg(long)]
+    #[arg(long, env = "SAMPLY_BREAKPAD_SYMBOL_SERVER", value_delimiter = ',')]
     pub breakpad_symbol_server: Vec<String>,
 
     /// Additional local directories containing Breakpad .sym files
-    #[arg(long)]
+    #[arg(long, env = "SAMPLY_BREAKPAD_SYMBOL_DIR", value_delimiter = ',')]
     pub breakpad_symbol_dir: Vec<String>,
 
     /// Overrides the default cache directory for Breakpad symbol files
