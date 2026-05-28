@@ -3,7 +3,7 @@ name = "samply"
 version = "0.13.1"
 authors = ["Markus Stange <mstange@themasta.com>"]
 edition = "2021"
-rust-version = "1.84" # needed by samply-quota-manager -> rusqlite_migration
+rust-version = "1.84"                                        # needed by samply-quota-manager -> rusqlite_migration
 license = "MIT OR Apache-2.0"
 description = "A command line profiler for macOS and Linux."
 repository = "https://github.com/mstange/samply/"
@@ -16,7 +16,8 @@ doctest = false
 
 fxprof-processed-profile = { version = "0.8", path = "../fxprof-processed-profile" }
 # framehop = { path = "../../framehop" }
-framehop = "0.16"
+# TODO: Change to codspeedHQ/framehop-codspeed once repo is created
+framehop = { git = "https://github.com/CodSpeedHQ/framehop", rev = "3a47fc0965df8221ee180547b70c3aa04d93b795" }
 # linux-perf-data = { path = "../../linux-perf-data", default-features = false }
 linux-perf-data = { version = "0.13" }
 
@@ -43,7 +44,7 @@ rand = "0.10"
 nix-base32 = "0.2.0"
 serde_derive = "1.0.137"
 serde = "1.0.204"
-wholesym = { version = "0.8.1", path = "../wholesym", features = ["api"]}
+wholesym = { version = "0.8.1", path = "../wholesym", features = ["api"] }
 platform-dirs = "0.3"
 rustc-hash = "2"
 schnellru = "0.2"
@@ -95,22 +96,24 @@ winver = "1"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.61"
-features =  ["Win32",
-             "Win32_Foundation",
-             "Win32_Security",
-             "Win32_Security_Authorization",
-             "Win32_Storage",
-             "Win32_Storage_FileSystem",
-             "Win32_System",
-             "Win32_System_Diagnostics_Debug",
-             "Win32_System_Diagnostics_Etw",
-             "Win32_System_Memory",
-             "Win32_System_ProcessStatus",
-             "Win32_System_SystemInformation",
-             "Win32_System_Threading",
-             "Win32_System_Time",
-             "Win32_System_WindowsProgramming",
-             "Win32_UI_WindowsAndMessaging"]
+features = [
+    "Win32",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage",
+    "Win32_Storage_FileSystem",
+    "Win32_System",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_WindowsAndMessaging",
+]
 
 [dependencies.object]
 default-features = false
