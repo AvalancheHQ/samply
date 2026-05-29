@@ -17,7 +17,7 @@ doctest = false
 fxprof-processed-profile = { version = "0.8", path = "../fxprof-processed-profile" }
 # framehop = { path = "../../framehop" }
 # TODO: Change to codspeedHQ/framehop-codspeed once repo is created
-framehop = { git = "https://github.com/CodSpeedHQ/framehop", rev = "3a47fc0965df8221ee180547b70c3aa04d93b795" }
+framehop = { git = "https://github.com/CodSpeedHQ/framehop", rev = "bdf2813a2c5149fd66b9b4685035e70124bd672a" }
 # linux-perf-data = { path = "../../linux-perf-data", default-features = false }
 linux-perf-data = { version = "0.13" }
 

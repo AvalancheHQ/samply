@@ -748,8 +748,7 @@ dependencies = [
 [[package]]
 name = "framehop"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f54fe4785e899d4d6f43793b151c63c5647240fc630b005509d2614a939f693"
+source = "git+https://github.com/CodSpeedHQ/framehop?rev=bdf2813a2c5149fd66b9b4685035e70124bd672a#bdf2813a2c5149fd66b9b4685035e70124bd672a"
 dependencies = [
  "arrayvec",
  "cfg-if",
