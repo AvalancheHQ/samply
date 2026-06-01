@@ -119,3 +119,9 @@ features = [
 default-features = false
 features = ["std", "read_core", "elf", "pe", "unaligned", "write"]
 version = "0.39"
+
+[dev-dependencies]
+# Used by integration tests to read the gzipped processed-profile JSON that
+# `samply record --save-only` writes. Both are already in the dependency graph.
+flate2 = "1.1"
+serde_json = "1"
