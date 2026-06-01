@@ -133,6 +133,7 @@ pub fn run(
             match task_accepter.next_message(timeout) {
                 Ok(ReceivedStuff::AcceptedTask(accepted_task)) => {
                     let pid = accepted_task.get_id();
+                    log::debug!("preload-IPC task connected: pid={pid}");
                     if !seen_pids.lock().unwrap().insert(pid) {
                         // The descendant watcher already registered this pid. Don't
                         // push a duplicate task into the sampler, but still unblock

@@ -183,6 +183,47 @@ impl TaskAccepter {
         };
         add_env("DYLD_INSERT_LIBRARIES", preload_lib_path.as_os_str());
         add_env("SAMPLY_BOOTSTRAP_SERVER_NAME", OsStr::new(&server_name));
+        drop(add_env);
+
+        // Node re-injection across the platform-binary DYLD strip.
+        //
+        // `#!/usr/bin/env node` shebangs (pnpm, vitest, every node_modules/.bin
+        // script) route through /usr/bin/env — an Apple platform binary — which
+        // strips DYLD_* before node starts, so the preload never loads into those
+        // node processes. NODE_OPTIONS is not a DYLD_ var, so it survives the
+        // strip. We point it at a tiny `--require` bootstrap that re-sets
+        // DYLD_INSERT_LIBRARIES + SAMPLY_BOOTSTRAP_SERVER_NAME in the process's
+        // environment. node honours dyld env vars (it ships
+        // allow-dyld-environment-variables), so the node children it then spawns
+        // directly (worker hosts, child_process.fork, …) DO load the preload and
+        // connect — even though the node that ran the bootstrap couldn't inject
+        // into itself (its own dyld had already run). This is the node analogue of
+        // BASH_ENV for shell scripts.
+        let bootstrap_path = dir.path().join("samply_node_bootstrap.cjs");
+        {
+            // JS string-literal escaping for the path and server name.
+            let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let mut f =
+                File::create(&bootstrap_path).expect("Couldn't create node bootstrap script");
+            write!(
+                f,
+                "process.env.DYLD_INSERT_LIBRARIES = \"{}\";\n\
+                 process.env.SAMPLY_BOOTSTRAP_SERVER_NAME = \"{}\";\n",
+                escape(&preload_lib_path.to_string_lossy()),
+                escape(&server_name),
+            )
+            .expect("Couldn't write node bootstrap script");
+        }
+        // Prepend our --require so any pre-existing NODE_OPTIONS still applies.
+        let mut node_options = format!("--require \"{}\"", bootstrap_path.to_string_lossy());
+        if let Some(existing) = std::env::var_os("NODE_OPTIONS") {
+            let existing = existing.to_string_lossy();
+            if !existing.trim().is_empty() {
+                node_options.push(' ');
+                node_options.push_str(&existing);
+            }
+        }
+        added_env.push(("NODE_OPTIONS".into(), node_options.into()));
 
         Ok(TaskAccepter {
             server,
