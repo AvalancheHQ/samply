@@ -1,230 +1,126 @@
+//! Launch-mode descendant watcher.
+//!
+//! samply normally profiles a launched tree by injecting `DYLD_INSERT_LIBRARIES`
+//! so each descendant loads `samply-mac-preload` and volunteers its mach task
+//! port over IPC. That breaks the moment the tree crosses a process that strips
+//! `DYLD_*` — most importantly `/usr/bin/env`, an Apple *platform binary*. A
+//! command like `samply record -- pnpm …` resolves through `#!/usr/bin/env node`,
+//! so the very first exec drops the preload and nothing below it ever connects.
+//! samply then has no task at all and aborts with "Could not obtain the root
+//! task", discarding a perfectly good run.
+//!
+//! This watcher is the fallback: it polls the descendant tree of the launched
+//! root pid and, for every process it is allowed to inspect, grabs the task port
+//! directly with `task_for_pid` and hands it to the sampler — no preload needed.
+//! Node (and locally-built binaries) ship `get-task-allow`, so they become
+//! profilable this way even though they never loaded the preload. It requires
+//! samply itself to hold the `com.apple.security.cs.debugger` entitlement (run
+//! `samply setup`); without it `task_for_pid` fails and the watcher simply
+//! attaches nothing.
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 
-use super::process_launcher::{get_all_descendant_pids, task_for_pid_and_queue, ReceivedStuff};
+use super::process_launcher::{get_all_descendant_pids, task_for_pid_checked};
+use super::sampler::{TaskInit, TaskInitOrShutdown};
+use super::time::get_monotonic_timestamp;
 
-/// Register `pid` with a kqueue to deliver NOTE_FORK and NOTE_EXIT events.
-/// Errors (e.g. ESRCH when the process has already exited) are silently ignored.
-fn watch_pid(kq: libc::c_int, pid: u32) {
-    let change = libc::kevent {
-        ident: pid as libc::uintptr_t,
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_CLEAR,
-        fflags: libc::NOTE_FORK | libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    unsafe {
-        libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
-    }
-}
-
-fn try_attach(pid: u32, queue: &Arc<Mutex<Vec<ReceivedStuff>>>, already_queued: &mut HashSet<u32>) {
-    if already_queued.contains(&pid) {
-        return;
-    }
-    if task_for_pid_and_queue(pid, queue, true) {
-        log::debug!("proc_watcher: task_for_pid attached pid={pid}");
-        already_queued.insert(pid);
-    } else {
-        log::debug!("proc_watcher: task_for_pid failed for pid={pid} (will rely on IPC)");
-    }
-}
-
-fn register_and_attach(
-    kq: libc::c_int,
-    pid: u32,
-    queue: &Arc<Mutex<Vec<ReceivedStuff>>>,
-    watched: &mut HashSet<u32>,
-    already_queued: &mut HashSet<u32>,
-) {
-    if !watched.insert(pid) {
-        return;
-    }
-    log::debug!("proc_watcher: watching pid={pid}");
-    watch_pid(kq, pid);
-    try_attach(pid, queue, already_queued);
-}
-
-/// Watch descendants of `root_pid` using kqueue, attaching via task_for_pid when
-/// available and relying on the preload IPC path otherwise.
+/// Poll the descendant tree of the launched root pid, attaching to every process
+/// we can via `task_for_pid` and forwarding it to the sampler.
 ///
-/// Blocks until `stop_rx` receives a message. Spawned as a dedicated thread in
-/// launch mode by [`crate::mac::profiler::run`].
+/// `seen_pids` is shared with the IPC accepter loop so each pid is forwarded to
+/// the sampler at most once, no matter which path reaches it first. Blocks until
+/// `stop_rx` fires (sent once the root process tree has exited).
 pub fn watch_descendants(
     root_pid_rx: Receiver<u32>,
-    queue_handle: Arc<Mutex<Vec<ReceivedStuff>>>,
+    task_sender: Sender<TaskInitOrShutdown>,
+    seen_pids: Arc<Mutex<HashSet<u32>>>,
     stop_rx: Receiver<()>,
 ) {
     let Ok(root_pid) = root_pid_rx.recv_timeout(Duration::from_secs(5)) else {
-        log::debug!("proc_watcher: timed out waiting for root_pid");
+        log::debug!("proc_watcher: timed out waiting for the root pid");
         return;
     };
+    log::debug!("proc_watcher: watching descendants of root pid {root_pid}");
 
-    log::debug!("proc_watcher: starting, root_pid={root_pid}");
+    let poll_interval = Duration::from_millis(
+        std::env::var("SAMPLY_DESCENDANT_POLL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50),
+    );
 
-    let kq = unsafe { libc::kqueue() };
-    if kq == -1 {
-        log::warn!("proc_watcher: kqueue() failed");
-        return;
-    }
-
-    let mut watched: HashSet<u32> = HashSet::new();
-    let mut already_queued: HashSet<u32> = HashSet::new();
-
-    // Seed: watch root_pid plus any descendants already running, closing the
-    // race between process start and our kqueue registration.
-    for pid in std::iter::once(root_pid).chain(get_all_descendant_pids(root_pid)) {
-        register_and_attach(kq, pid, &queue_handle, &mut watched, &mut already_queued);
-    }
-
+    let mut roots = vec![root_pid];
+    // Pids seen in the previous poll. We only attach a pid once it has been
+    // visible for a full interval, which gives the faster preload-IPC path first
+    // claim on any process that *will* load the preload — so we don't steal a
+    // preload process out from under its jitdump/marker-path stream (which only
+    // the IPC accepter can route). For trees that never load the preload (the
+    // `/usr/bin/env` case) the pid simply persists and is attached next round.
+    let mut prev_round: HashSet<u32> = HashSet::new();
     loop {
-        if stop_rx.try_recv().is_ok() {
+        // Pick up root pids reported by later `--iteration-count` launches.
+        while let Ok(extra_root) = root_pid_rx.try_recv() {
+            roots.push(extra_root);
+        }
+
+        let mut this_round: HashSet<u32> = HashSet::new();
+        for &root in &roots {
+            this_round.insert(root);
+            this_round.extend(get_all_descendant_pids(root));
+        }
+
+        for &pid in &this_round {
+            if prev_round.contains(&pid) {
+                attempt_attach(pid, &task_sender, &seen_pids);
+            }
+        }
+        prev_round = this_round;
+
+        // Sleep until the next poll, but wake immediately when asked to stop.
+        if stop_rx.recv_timeout(poll_interval).is_ok() {
             log::debug!("proc_watcher: stopping");
             break;
         }
-
-        // Block up to 100 ms so we notice stop signals promptly while spending
-        // essentially zero CPU between fork events.
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 100_000_000,
-        };
-        let mut events = [unsafe { std::mem::zeroed::<libc::kevent>() }; 32];
-        let n = unsafe {
-            libc::kevent(
-                kq,
-                std::ptr::null(),
-                0,
-                events.as_mut_ptr(),
-                events.len() as libc::c_int,
-                &timeout,
-            )
-        };
-        if n < 0 {
-            break;
-        }
-
-        for event in events.iter().take(n as usize) {
-            let fflags = event.fflags;
-            let pid = event.ident as u32;
-
-            if fflags & libc::NOTE_FORK != 0 {
-                // macOS NOTE_FORK does not deliver the child pid in event.data
-                // (always 0, unlike FreeBSD). Scan from the forking process to
-                // discover its new children and any grandchildren already running.
-                log::debug!("proc_watcher: NOTE_FORK on pid={pid}, scanning descendants");
-                for new_pid in get_all_descendant_pids(pid) {
-                    register_and_attach(
-                        kq,
-                        new_pid,
-                        &queue_handle,
-                        &mut watched,
-                        &mut already_queued,
-                    );
-                }
-            }
-
-            if fflags & libc::NOTE_EXIT != 0 {
-                log::debug!("proc_watcher: NOTE_EXIT pid={pid}");
-                watched.remove(&pid);
-            }
-        }
     }
-
-    unsafe { libc::close(kq) };
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    /// kqueue NOTE_FORK fires when the watched process spawns a child.
-    /// Also confirms that on macOS event.data is 0 (child pid not delivered).
-    #[test]
-    fn note_fork_fires_on_child_spawn() {
-        let kq = unsafe { libc::kqueue() };
-        assert!(kq != -1, "kqueue() failed");
-
-        watch_pid(kq, std::process::id());
-
-        let mut child = std::process::Command::new("/usr/bin/true")
-            .spawn()
-            .expect("failed to spawn /usr/bin/true");
-        child.wait().unwrap();
-
-        let timeout = libc::timespec {
-            tv_sec: 1,
-            tv_nsec: 0,
-        };
-        let mut events = [unsafe { std::mem::zeroed::<libc::kevent>() }; 8];
-        let n = unsafe {
-            libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), 8, &timeout)
-        };
-
-        assert!(n > 0, "expected at least one kqueue event, got {n}");
-        let fork_event = events
-            .iter()
-            .take(n as usize)
-            .find(|e| e.fflags & libc::NOTE_FORK != 0)
-            .expect("expected NOTE_FORK event");
-
-        // macOS does not deliver the child pid in data (always 0).
-        // Copy to a local to avoid packed-struct alignment issues.
-        let data = fork_event.data;
-        assert_eq!(data, 0, "macOS NOTE_FORK should have data=0, got {data}");
-
-        unsafe { libc::close(kq) };
+/// `task_for_pid` `pid` and forward it to the sampler, unless another path has
+/// already claimed it.
+fn attempt_attach(
+    pid: u32,
+    task_sender: &Sender<TaskInitOrShutdown>,
+    seen_pids: &Arc<Mutex<HashSet<u32>>>,
+) {
+    // Claim the pid first so we never double-register with the IPC path.
+    if !seen_pids.lock().unwrap().insert(pid) {
+        return;
     }
 
-    /// BASH_ENV is sourced by bash for non-interactive scripts, so a value
-    /// exported there is visible to the script — and crucially survives the
-    /// hardened /usr/bin/env exec chain that strips DYLD_* variables.
-    fn run_script_with_bash_env(shebang: &str) -> String {
-        let tmpdir = tempfile::tempdir().unwrap();
+    let Some(task) = task_for_pid_checked(pid) else {
+        // Roll the claim back: the preload-IPC path might still reach this pid
+        // even though task_for_pid couldn't (e.g. it's about to load the preload).
+        seen_pids.lock().unwrap().remove(&pid);
+        return;
+    };
 
-        let env_file = tmpdir.path().join("env.sh");
-        std::fs::write(&env_file, "export SAMPLY_TEST_VAR=injected\n").unwrap();
+    log::debug!("proc_watcher: attached pid {pid} via task_for_pid");
 
-        let script = tmpdir.path().join("script.sh");
-        std::fs::write(
-            &script,
-            format!("{shebang}\necho $SAMPLY_TEST_VAR\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let output = std::process::Command::new(&script)
-            .env("BASH_ENV", &env_file)
-            .env_remove("SAMPLY_TEST_VAR")
-            .output()
-            .expect("failed to run script");
-
-        String::from_utf8(output.stdout).unwrap().trim().to_string()
-    }
-
-    #[test]
-    fn bash_env_injects_through_usr_bin_env_bash() {
-        assert_eq!(
-            run_script_with_bash_env("#!/usr/bin/env bash"),
-            "injected"
-        );
-    }
-
-    #[test]
-    fn bash_env_injects_through_bin_bash() {
-        assert_eq!(run_script_with_bash_env("#!/bin/bash"), "injected");
-    }
-
-    #[test]
-    fn bash_env_injects_through_usr_bin_env_bin_bash() {
-        assert_eq!(
-            run_script_with_bash_env("#!/usr/bin/env /bin/bash"),
-            "injected"
-        );
+    // These processes never loaded the preload, so there is no jitdump/marker
+    // path stream for them. Hand the sampler a receiver whose sender we drop
+    // immediately; `check_received_paths` then sees an empty, closed channel.
+    let (_path_sender, path_receiver) = crossbeam_channel::unbounded();
+    let send_result = task_sender.send(TaskInitOrShutdown::TaskInit(TaskInit {
+        start_time_mono: get_monotonic_timestamp(),
+        task,
+        pid,
+        path_receiver,
+    }));
+    if send_result.is_err() {
+        // The sampler has already shut down.
+        seen_pids.lock().unwrap().remove(&pid);
     }
 }

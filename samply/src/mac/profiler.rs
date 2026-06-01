@@ -1,13 +1,15 @@
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::ExitStatus;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, unbounded};
 use fxprof_processed_profile::Profile;
 
 use super::error::SamplingError;
+use super::proc_watcher::watch_descendants;
 use super::process_launcher::{
     ExistingProcessRunner, MachError, ReceivedStuff, RootTaskRunner, TaskAccepter, TaskLauncher,
 };
@@ -24,6 +26,12 @@ pub fn run(
 ) -> Result<(Profile, ExitStatus), MachError> {
     let mut task_accepter = TaskAccepter::new()?;
 
+    // In launch mode, the launcher reports each root child's pid here so the
+    // descendant watcher can task_for_pid-attach a tree whose root stripped
+    // DYLD_INSERT_LIBRARIES (e.g. a `#!/usr/bin/env …` script).
+    let (root_pid_tx, root_pid_rx) = unbounded::<u32>();
+    let mut launch_mode = false;
+
     let mut root_task_runner: Box<dyn RootTaskRunner> = match recording_mode {
         RecordingMode::All => {
             eprintln!("Error: Profiling all processes is not supported on macOS.");
@@ -32,6 +40,7 @@ pub fn run(
         }
         RecordingMode::Pid(pid) => Box::new(ExistingProcessRunner::new(pid, &mut task_accepter)),
         RecordingMode::Launch(process_launch_props) => {
+            launch_mode = true;
             let ProcessLaunchProps {
                 mut env_vars,
                 command_name,
@@ -40,7 +49,7 @@ pub fn run(
                 ignore_exit_code,
             } = process_launch_props;
 
-            let task_launcher = if profile_creation_props.coreclr.any_enabled() {
+            let mut task_launcher = if profile_creation_props.coreclr.any_enabled() {
                 // We need to set DOTNET_PerfMapEnabled=3 in the environment if it's not already set.
                 // If we set it, we'll also set unlink_aux_files=true to avoid leaving files
                 // behind in the temp directory. But if it's set manually, assume the user
@@ -71,6 +80,7 @@ pub fn run(
                 )?
             };
 
+            task_launcher.set_root_pid_sender(root_pid_tx);
             Box::new(task_launcher)
         }
     };
@@ -82,8 +92,31 @@ pub fn run(
         sampler.run()
     });
 
+    // Pids already forwarded to the sampler. Shared between the IPC accepter loop
+    // (preload injection) and the descendant watcher (task_for_pid) so a pid that
+    // both paths reach is registered only once.
+    let seen_pids: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Descendant watcher: profiles processes that never loaded the preload because
+    // an ancestor stripped DYLD_INSERT_LIBRARIES (the `/usr/bin/env` case). Only
+    // meaningful in launch mode, where we know the root pid; --pid mode already
+    // task_for_pid-attaches the whole tree up front via ExistingProcessRunner.
+    let (watcher_stop_tx, watcher_stop_rx) = bounded::<()>(1);
+    let watcher_thread = if launch_mode {
+        let task_sender = task_sender.clone();
+        let seen_pids = Arc::clone(&seen_pids);
+        Some(thread::spawn(move || {
+            watch_descendants(root_pid_rx, task_sender, seen_pids, watcher_stop_rx);
+        }))
+    } else {
+        drop(root_pid_rx);
+        None
+    };
+
     let (accepter_sender, accepter_receiver) = unbounded();
+    let accepter_seen_pids = Arc::clone(&seen_pids);
     let accepter_thread = thread::spawn(move || {
+        let seen_pids = accepter_seen_pids;
         // Loop while accepting messages from the spawned process tree.
 
         // A map of pids to channel senders, to notify existing tasks of Jitdump
@@ -100,6 +133,13 @@ pub fn run(
             match task_accepter.next_message(timeout) {
                 Ok(ReceivedStuff::AcceptedTask(accepted_task)) => {
                     let pid = accepted_task.get_id();
+                    if !seen_pids.lock().unwrap().insert(pid) {
+                        // The descendant watcher already registered this pid. Don't
+                        // push a duplicate task into the sampler, but still unblock
+                        // the preload-suspended child so it can run.
+                        accepted_task.start_execution();
+                        continue;
+                    }
                     let (path_sender, path_receiver) = unbounded();
                     let send_result = task_sender.send(TaskInitOrShutdown::TaskInit(TaskInit {
                         start_time_mono: get_monotonic_timestamp(),
@@ -176,6 +216,12 @@ pub fn run(
 
     // Run the root task: either launch or attach to existing pid
     let exit_status = root_task_runner.run_root_task()?;
+
+    // The root process tree has exited; stop the descendant watcher.
+    let _ = watcher_stop_tx.send(());
+    if let Some(watcher_thread) = watcher_thread {
+        watcher_thread.join().expect("couldn't join watcher thread");
+    }
 
     accepter_sender
         .send(())

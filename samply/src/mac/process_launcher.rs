@@ -9,6 +9,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossbeam_channel::Sender;
 use flate2::write::GzDecoder;
 use mach2::port::{mach_port_t, MACH_PORT_NULL};
 use mach2::task::{task_resume, task_suspend};
@@ -29,6 +30,12 @@ pub struct TaskLauncher {
     child_env: Vec<(OsString, OsString)>,
     iteration_count: u32,
     ignore_exit_code: bool,
+    /// When set, the pid of each launched root child is reported here. The
+    /// descendant watcher uses it to seed `task_for_pid`-based attachment, which
+    /// is the only way to profile a tree whose root strips `DYLD_INSERT_LIBRARIES`
+    /// (e.g. a `#!/usr/bin/env …` script, where `/usr/bin/env` is a platform
+    /// binary and the preload never loads).
+    root_pid_sender: Option<Sender<u32>>,
 }
 
 impl RootTaskRunner for TaskLauncher {
@@ -39,6 +46,7 @@ impl RootTaskRunner for TaskLauncher {
         let mut ctrl_c_receiver = CtrlC::observe_oneshot();
 
         let mut root_child = self.launch_child();
+        self.report_root_pid(root_child.id());
         let mut exit_status = root_child.wait().expect("couldn't wait for child");
 
         for i in 2..=self.iteration_count {
@@ -50,6 +58,7 @@ impl RootTaskRunner for TaskLauncher {
             }
             eprintln!("Running iteration {i} of {}...", self.iteration_count);
             let mut root_child = self.launch_child();
+            self.report_root_pid(root_child.id());
             exit_status = root_child.wait().expect("couldn't wait for child");
         }
 
@@ -93,7 +102,20 @@ impl TaskLauncher {
             child_env,
             iteration_count,
             ignore_exit_code,
+            root_pid_sender: None,
         })
+    }
+
+    /// Install a channel that each launched root child's pid is reported to.
+    pub fn set_root_pid_sender(&mut self, sender: Sender<u32>) {
+        self.root_pid_sender = Some(sender);
+    }
+
+    fn report_root_pid(&self, pid: u32) {
+        if let Some(sender) = &self.root_pid_sender {
+            // The receiver may already be gone (watcher disabled / shut down).
+            let _ = sender.send(pid);
+        }
     }
 
     pub fn launch_child(&self) -> Child {
@@ -299,22 +321,6 @@ impl RootTaskRunner for ExistingProcessRunner {
 }
 
 impl ExistingProcessRunner {
-    fn get_all_descendant_pids(pid: u32) -> Vec<u32> {
-        let mut descendants = Vec::new();
-        let mut queue = vec![pid];
-
-        while let Some(current_pid) = queue.pop() {
-            if let Some(child_pids) = find_child_processes(current_pid) {
-                for child_pid in child_pids {
-                    descendants.push(child_pid);
-                    queue.push(child_pid);
-                }
-            }
-        }
-
-        descendants
-    }
-
     pub fn new(pid: u32, task_accepter: &mut TaskAccepter) -> ExistingProcessRunner {
         let mut queue_pid = |pid, failure_is_ok| {
             let task = unsafe {
@@ -347,7 +353,7 @@ impl ExistingProcessRunner {
         queue_pid(pid, false);
 
         // find all its descendants recursively
-        let descendant_pids = Self::get_all_descendant_pids(pid);
+        let descendant_pids = get_all_descendant_pids(pid);
         for pid in descendant_pids {
             queue_pid(pid, true);
         }
@@ -408,4 +414,40 @@ fn find_child_processes(parent_pid: u32) -> Option<Vec<u32>> {
         pids.set_len(child_pid_count);
     }
     Some(pids)
+}
+
+/// Recursively collect every descendant pid of `pid` (children, grandchildren, …),
+/// not including `pid` itself.
+pub fn get_all_descendant_pids(pid: u32) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    let mut queue = vec![pid];
+
+    while let Some(current_pid) = queue.pop() {
+        if let Some(child_pids) = find_child_processes(current_pid) {
+            for child_pid in child_pids {
+                descendants.push(child_pid);
+                queue.push(child_pid);
+            }
+        }
+    }
+
+    descendants
+}
+
+/// Try to obtain the mach task port for `pid` via `task_for_pid`, without
+/// suspending it. Returns `None` if the call fails — which is normal and
+/// expected for processes we are not allowed to inspect (platform binaries
+/// without `get-task-allow`, already-exited processes, etc.).
+///
+/// Unlike the `--pid` attach path this never exits the process on failure: in
+/// launch mode `task_for_pid` is a best-effort supplement to DYLD injection, so
+/// a failure just means "skip this pid".
+pub fn task_for_pid_checked(pid: u32) -> Option<mach_port_t> {
+    let mut task = MACH_PORT_NULL;
+    let kr = unsafe { task_for_pid(mach_task_self(), pid as i32, &mut task) };
+    if kr != 0 {
+        log::debug!("task_for_pid({pid}) failed with kern error {kr}");
+        return None;
+    }
+    Some(task)
 }

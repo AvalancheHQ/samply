@@ -21,15 +21,18 @@
 //!      root task and writes no profile at all — which trivially satisfies "no
 //!      python profiled").
 //!
-//! This is a stable characterization of the platform-binary limitation: the
-//! `BASH_ENV` re-injection mechanism does NOT change this exact case (a bare
-//! `env`-shebang script as samply's direct target still can't be profiled,
-//! since `env` is the root). BASH_ENV helps the *descendants* of a profilable
-//! root re-acquire `DYLD_INSERT_LIBRARIES` after a shell strips it; it cannot
-//! resurrect a root that was itself a platform binary.
+//! Note on the descendant watcher: samply now also runs a launch-mode watcher
+//! (`mac::proc_watcher`) that attaches to descendants via `task_for_pid` instead
+//! of the preload, which DOES profile `get-task-allow` processes (Node, etc.)
+//! below an `env` root — but only when the samply binary holds the
+//! `com.apple.security.cs.debugger` entitlement (`samply setup`). The binary
+//! that `cargo test` builds is unsigned, so `task_for_pid` fails here and the
+//! watcher attaches nothing; this test therefore still observes the
+//! un-entitled, preload-only behaviour (python not profiled). If you sign the
+//! test binary with the debugger entitlement, python WOULD be profiled and this
+//! assertion would flip.
 //!
-//! macOS-only (`cfg(target_os = "macos")`). Launch-mode profiling needs no
-//! `task_for_pid` entitlements, so no `samply setup` is required.
+//! macOS-only (`cfg(target_os = "macos")`).
 //!
 //! Run with:
 //!   cargo test -p samply --test env_strips_dyld -- --nocapture

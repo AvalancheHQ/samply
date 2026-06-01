@@ -6,6 +6,7 @@ mod error;
 pub mod kernel_error;
 mod mach_ipc;
 mod proc_maps;
+mod proc_watcher;
 mod process_launcher;
 pub mod profiler;
 mod sampler;
