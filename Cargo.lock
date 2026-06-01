@@ -1445,6 +1445,20 @@ dependencies = [
  "prost",
  "prost-derive",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "linux-perf-data"
+version = "0.13.0"
+source = "git+https://github.com/AvalancheHQ/linux-perf-data?rev=effe486#effe486d4a951d6655007a163b837e7c4a15848c"
+dependencies = [
+ "byteorder",
+ "linear-map",
+ "linux-perf-event-reader",
+ "memchr",
+ "prost",
+ "prost-derive",
+ "thiserror 2.0.18",
  "zstd-safe",
 ]
 
@@ -2540,7 +2554,7 @@ dependencies = [
  "indexmap",
  "lazy_static",
  "libc",
- "linux-perf-data",
+ "linux-perf-data 0.13.0 (git+https://github.com/AvalancheHQ/linux-perf-data?rev=effe486)",
  "log",
  "mach2",
  "memchr",
@@ -2651,7 +2665,7 @@ dependencies = [
  "flate2",
  "futures",
  "gimli",
- "linux-perf-data",
+ "linux-perf-data 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "lzma-rs",
  "macho-unwind-info",
  "memchr",
