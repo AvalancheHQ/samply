@@ -162,6 +162,16 @@ impl TaskAccepter {
         add_env("DYLD_INSERT_LIBRARIES", preload_lib_path.as_os_str());
         add_env("SAMPLY_BOOTSTRAP_SERVER_NAME", OsStr::new(&server_name));
 
+        // Keep DYLD_INSERT_LIBRARIES (and therefore the preload) alive across SIP
+        // system-binary execs (`/usr/bin/env`, `/bin/sh`, the coreutils, …),
+        // which would otherwise strip DYLD_* and hide the whole subtree. The
+        // preload's `sip_redirect` module reads this dir and transparently runs
+        // ad-hoc re-signed copies of those binaries from it.
+        let sip_redirect_dir = std::env::temp_dir().join("samply-sip-redirect");
+        if std::fs::create_dir_all(&sip_redirect_dir).is_ok() {
+            add_env("SAMPLY_SIP_REDIRECT_DIR", sip_redirect_dir.as_os_str());
+        }
+
         Ok(TaskAccepter {
             server,
             added_env,
