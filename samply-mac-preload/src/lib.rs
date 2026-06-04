@@ -5,6 +5,7 @@ use libc::{c_char, c_int, mode_t, FILE};
 
 use core::ffi::CStr;
 
+mod logging;
 mod mach_ipc;
 mod mach_sys;
 
@@ -30,6 +31,7 @@ fn panic(_panic: &core::panic::PanicInfo<'_>) -> ! {
 #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static __SETUP_SAMPLY_CONNECTION: unsafe extern "C" fn() = {
     unsafe extern "C" fn __load_samply_lib() {
+        logging::init();
         let _ = set_up_samply_connection();
     }
     __load_samply_lib
@@ -79,6 +81,7 @@ fn set_up_samply_connection() -> Option<()> {
     // is immovable and sending it would get us SIGKILLed. See
     // `is_platform_binary`.
     if is_platform_binary() {
+        log::debug!("samply_preload: skipping handoff (platform binary)");
         return None;
     }
     let (tx0, rx0) = channel().ok()?;
@@ -109,6 +112,7 @@ fn set_up_samply_connection() -> Option<()> {
     let mut recv_buf = [0; 256];
     let result = rx0.recv(&mut recv_buf).ok()?;
     assert_eq!(b"Proceed", &result);
+    log::debug!("samply_preload: ready");
     Some(())
 }
 
