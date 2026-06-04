@@ -162,6 +162,17 @@ impl TaskAccepter {
         add_env("DYLD_INSERT_LIBRARIES", preload_lib_path.as_os_str());
         add_env("SAMPLY_BOOTSTRAP_SERVER_NAME", OsStr::new(&server_name));
 
+        // Expose the preload path under a second, non-`DYLD_`-prefixed name.
+        // macOS SIP strips every `DYLD_*` variable when execing a protected
+        // system binary (`/usr/bin/env`, `/bin/sh`, …).
+        //
+        // This alias survives the stripping, so a script closer to the process
+        // under observation can re-enable `DYLD_INSERT_LIBRARIES`.
+        added_env.push((
+            "SAMPLY_DYLD_INSERT_LIBRARIES".into(),
+            preload_lib_path.as_os_str().to_owned(),
+        ));
+
         Ok(TaskAccepter {
             server,
             added_env,
