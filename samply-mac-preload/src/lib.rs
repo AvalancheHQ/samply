@@ -8,6 +8,7 @@ use core::ffi::CStr;
 mod logging;
 mod mach_ipc;
 mod mach_sys;
+mod sip_warn;
 
 use mach_ipc::{channel, mach_task_self, OsIpcChannel, OsIpcSender};
 
@@ -206,6 +207,15 @@ fn detect_and_send_marker_file_path(path: &str) {
 pub struct InterposeEntry {
     _new: *const (),
     _old: *const (),
+}
+
+impl InterposeEntry {
+    pub const fn new(new: *const (), old: *const ()) -> Self {
+        InterposeEntry {
+            _new: new,
+            _old: old,
+        }
+    }
 }
 
 #[used]
