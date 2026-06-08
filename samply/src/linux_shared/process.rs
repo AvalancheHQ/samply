@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use framehop::Unwinder;
@@ -33,6 +34,12 @@ pub struct Process<U> {
     pub jit_app_cache_mapping_ops: LibMappingOpQueue,
     pub jit_function_recycler: Option<JitFunctionRecycler>,
     marker_file_paths: Vec<(ThreadHandle, PathBuf, Vec<PathBuf>)>,
+    /// Per-process cache of stack memory previously read during unwinding,
+    /// keyed by absolute stack address. The upper part of the stack (the frames
+    /// above the churning leaf) is stable across samples, so when an unwind
+    /// walks past the current sample's captured stack window we can satisfy the
+    /// read from a value seen in an earlier sample instead of truncating.
+    pub stack_read_cache: HashMap<u64, u64>,
     pub prev_mm_filepages_size: i64,
     pub prev_mm_anonpages_size: i64,
     pub prev_mm_swapents_size: i64,
@@ -80,6 +87,7 @@ where
             jit_app_cache_mapping_ops: LibMappingOpQueue::default(),
             jit_function_recycler,
             marker_file_paths: Vec::new(),
+            stack_read_cache: HashMap::new(),
             prev_mm_filepages_size: 0,
             prev_mm_anonpages_size: 0,
             prev_mm_swapents_size: 0,

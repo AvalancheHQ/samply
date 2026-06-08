@@ -273,6 +273,7 @@ where
             e,
             &process.unwinder,
             &mut self.cache,
+            &mut process.stack_read_cache,
             stack,
             self.fold_recursive_prefix,
             self.call_chain_return_addresses_are_preadjusted,
@@ -402,6 +403,7 @@ where
             e,
             &process.unwinder,
             &mut self.cache,
+            &mut process.stack_read_cache,
             stack,
             self.fold_recursive_prefix,
             self.call_chain_return_addresses_are_preadjusted,
@@ -514,6 +516,7 @@ where
             e,
             &process.unwinder,
             &mut self.cache,
+            &mut process.stack_read_cache,
             stack,
             self.fold_recursive_prefix,
             self.call_chain_return_addresses_are_preadjusted,
@@ -565,6 +568,7 @@ where
             e,
             &process.unwinder,
             &mut self.cache,
+            &mut process.stack_read_cache,
             stack,
             self.fold_recursive_prefix,
             self.call_chain_return_addresses_are_preadjusted,
@@ -620,6 +624,7 @@ where
         e: &SampleRecord,
         unwinder: &U,
         cache: &mut U::Cache,
+        stack_read_cache: &mut std::collections::HashMap<u64, u64>,
         stack: &mut Vec<StackFrame>,
         fold_recursive_prefix: bool,
         call_chain_return_addresses_are_preadjusted: bool,
@@ -658,10 +663,22 @@ where
             let ustack_bytes = RawDataU64::from_raw_data::<LittleEndian>(user_stack);
             let (pc, sp, regs) = C::convert_regs(regs);
             let mut read_stack = |addr: u64| {
-                // ustack_bytes has the stack bytes starting from the current stack pointer.
-                let offset = addr.checked_sub(sp).ok_or(())?;
-                let index = usize::try_from(offset / 8).map_err(|_| ())?;
-                ustack_bytes.get(index).ok_or(())
+                // Prefer this sample's freshly captured stack window. ustack_bytes
+                // has the stack bytes starting from the current stack pointer.
+                if let Some(value) = addr
+                    .checked_sub(sp)
+                    .and_then(|offset| usize::try_from(offset / 8).ok())
+                    .and_then(|index| ustack_bytes.get(index))
+                {
+                    // Remember it: the upper stack is stable across samples, so a
+                    // later sample whose window doesn't reach this far can still
+                    // satisfy the read.
+                    stack_read_cache.insert(addr, value);
+                    return Ok(value);
+                }
+                // The read is below sp or past the captured window. Fall back to
+                // a value seen in an earlier sample, if any.
+                stack_read_cache.get(&addr).copied().ok_or(())
             };
 
             // Unwind.
