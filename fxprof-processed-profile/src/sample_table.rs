@@ -1,4 +1,5 @@
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
@@ -24,8 +25,34 @@ pub struct SampleTable {
     sample_stack_indexes: Vec<Option<StackHandle>>,
     /// CPU usage delta since the previous sample for this thread, for each sample.
     sample_cpu_deltas: Vec<CpuDelta>,
+    /// Extra named per-sample delta columns, if any. See [`ExtraSampleDeltas`].
+    extra_deltas: Option<ExtraSampleDeltas>,
     is_sorted_by_time: bool,
     last_sample_timestamp: Timestamp,
+}
+
+/// Extra per-sample delta columns: named values carried by individual samples,
+/// in the spirit of `threadCPUDelta` — for example hardware event counts since
+/// the thread's previous sample.
+///
+/// Serialized as a `samplyEventDeltas` object on the samples table, one column
+/// per name, aligned with the other sample columns. Samples without a value
+/// for a column get `null`. This is a samply extension; the Firefox Profiler
+/// UI ignores it.
+#[derive(Debug, Clone)]
+struct ExtraSampleDeltas {
+    names: Arc<[String]>,
+    columns: Vec<Vec<Option<u64>>>,
+}
+
+impl ExtraSampleDeltas {
+    fn with_sample_count(names: Arc<[String]>, sample_count: usize) -> Self {
+        let column_count = names.len();
+        Self {
+            names,
+            columns: vec![vec![None; sample_count]; column_count],
+        }
+    }
 }
 
 /// Specifies the meaning of the "weight" value of a thread's samples.
@@ -80,12 +107,54 @@ impl SampleTable {
             sample_timestamps: Vec::new(),
             sample_stack_indexes: Vec::new(),
             sample_cpu_deltas: Vec::new(),
+            extra_deltas: None,
             is_sorted_by_time: true,
             last_sample_timestamp: Timestamp::from_nanos_since_reference(0),
         }
     }
 
     pub fn add_sample(
+        &mut self,
+        timestamp: Timestamp,
+        stack_index: Option<StackHandle>,
+        cpu_delta: CpuDelta,
+        weight: i32,
+    ) {
+        self.push_sample_row(timestamp, stack_index, cpu_delta, weight);
+        if let Some(extra) = &mut self.extra_deltas {
+            for column in &mut extra.columns {
+                column.push(None);
+            }
+        }
+    }
+
+    /// Like [`Self::add_sample`], but also records a value for each extra delta
+    /// column. `deltas` must have one entry per name, in `names` order.
+    pub fn add_sample_with_extra_deltas(
+        &mut self,
+        timestamp: Timestamp,
+        stack_index: Option<StackHandle>,
+        cpu_delta: CpuDelta,
+        weight: i32,
+        names: &Arc<[String]>,
+        deltas: &[Option<u64>],
+    ) {
+        let sample_count = self.sample_timestamps.len();
+        let extra = self.extra_deltas.get_or_insert_with(|| {
+            ExtraSampleDeltas::with_sample_count(names.clone(), sample_count)
+        });
+        assert_eq!(
+            deltas.len(),
+            extra.columns.len(),
+            "extra delta count must match the registered column names"
+        );
+        for (column, delta) in extra.columns.iter_mut().zip(deltas) {
+            column.push(*delta);
+        }
+        self.push_sample_row(timestamp, stack_index, cpu_delta, weight);
+    }
+
+    fn push_sample_row(
         &mut self,
         timestamp: Timestamp,
         stack_index: Option<StackHandle>,
@@ -139,6 +208,15 @@ impl Serialize for SampleTable {
             )?;
             map.serialize_entry("weight", &self.sample_weights)?;
             map.serialize_entry("threadCPUDelta", &self.sample_cpu_deltas)?;
+            if let Some(extra) = &self.extra_deltas {
+                map.serialize_entry(
+                    "samplyEventDeltas",
+                    &SerializableExtraSampleDeltas {
+                        extra,
+                        permutation: None,
+                    },
+                )?;
+            }
         } else {
             let mut indexes: Vec<usize> = (0..self.sample_timestamps.len()).collect();
             indexes.sort_unstable_by_key(|index| self.sample_timestamps[*index]);
@@ -161,6 +239,36 @@ impl Serialize for SampleTable {
                 "threadCPUDelta",
                 &SliceWithPermutation(&self.sample_cpu_deltas, &indexes),
             )?;
+            if let Some(extra) = &self.extra_deltas {
+                map.serialize_entry(
+                    "samplyEventDeltas",
+                    &SerializableExtraSampleDeltas {
+                        extra,
+                        permutation: Some(&indexes),
+                    },
+                )?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// Serializes [`ExtraSampleDeltas`] as an object with one column array per name.
+struct SerializableExtraSampleDeltas<'a> {
+    extra: &'a ExtraSampleDeltas,
+    permutation: Option<&'a [usize]>,
+}
+
+impl Serialize for SerializableExtraSampleDeltas<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.extra.names.len()))?;
+        for (name, column) in self.extra.names.iter().zip(&self.extra.columns) {
+            match self.permutation {
+                Some(indexes) => {
+                    map.serialize_entry(name, &SliceWithPermutation(column, indexes))?
+                }
+                None => map.serialize_entry(name, column)?,
+            }
         }
         map.end()
     }

@@ -45,6 +45,18 @@ pub struct Process<U> {
     pub prev_mm_swapents_size: i64,
     pub prev_mm_shmempages_size: i64,
     pub mem_counter: Option<CounterHandle>,
+    pub extra_event_instances: HashMap<(u64, i32), ExtraEventInstance>,
+}
+
+/// Delta-tracking state for one extra-event counter instance, keyed by
+/// (kernel event id, tid).
+pub struct ExtraEventInstance {
+    /// The extra per-sample delta dimension this instance's values feed,
+    /// shared with the event's other instances.
+    pub dim: usize,
+    /// The last raw value seen, used to turn the cumulative values carried by
+    /// samples into per-sample deltas.
+    pub prev_value: u64,
 }
 
 pub struct ProcessForkData<U> {
@@ -93,6 +105,7 @@ where
             prev_mm_swapents_size: 0,
             prev_mm_shmempages_size: 0,
             mem_counter: None,
+            extra_event_instances: HashMap::new(),
         }
     }
 

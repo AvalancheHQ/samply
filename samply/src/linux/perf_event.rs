@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::atomic::{fence, Ordering};
 use std::{cmp, fmt, io, mem, ptr, slice};
 
-use libc::{self, c_void, pid_t};
+use libc::{self, c_int, c_void, pid_t};
 use linux_perf_data::linux_perf_event_reader;
 use linux_perf_event_reader::{Endianness, RawData, RawEventRecord, RecordParseInfo, RecordType};
 
@@ -78,12 +78,33 @@ unsafe fn write_tail(pointer: *mut u8, value: u64) {
     ptr::write_volatile(&mut page.data_tail, value);
 }
 
+/// An extra event opened as a sibling of the sampling event in its kernel
+/// event group. Siblings don't sample and have no ring buffer of their own;
+/// they are scheduled onto the PMU together with the leader, and their values
+/// are delivered inline in the leader's samples via `PERF_SAMPLE_READ`.
+///
+/// The id/name pairing is established here, at open time, because the fd is
+/// the only link between the kernel-assigned id and the event we asked for.
+#[derive(Debug)]
+struct SiblingEvent {
+    fd: RawFd,
+    /// The kernel-assigned id of this event, matching `ReadValue::id` in the
+    /// leader's samples.
+    id: u64,
+    /// Label for the counter track this event's values feed.
+    name: String,
+}
+
+/// One sampling perf event with its ring buffer.
 #[derive(Debug)]
 pub struct Perf {
     event_ref_state: Rc<RefCell<EventRefState>>,
     buffer: *mut u8,
     size: u64,
     fd: RawFd,
+    /// Sibling events of this event's kernel event group. Empty unless extra
+    /// events were requested.
+    siblings: Vec<SiblingEvent>,
     position: u64,
     parse_info: RecordParseInfo,
 }
@@ -91,6 +112,9 @@ pub struct Perf {
 impl Drop for Perf {
     fn drop(&mut self) {
         unsafe {
+            for sibling in &self.siblings {
+                libc::close(sibling.fd);
+            }
             libc::close(self.fd);
         }
     }
@@ -150,6 +174,97 @@ pub enum EventSource {
     SwCpuClock,
 }
 
+impl EventSource {
+    /// The `(perf_event_attr.type, perf_event_attr.config)` pair for this event.
+    fn type_and_config(self) -> (u32, u64) {
+        match self {
+            EventSource::HwCpuCycles => (PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES),
+            EventSource::SwCpuClock => (PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK),
+        }
+    }
+}
+
+/// An extra counter to read alongside the main sampling event.
+///
+/// Extra events are opened as counting-only siblings of the sampling event in
+/// its kernel event group. With `PERF_SAMPLE_READ | PERF_FORMAT_GROUP`, every
+/// sample carries the current value of each sibling, so the per-sample delta
+/// gives the number of events that occurred since the previous sample.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExtraEvent {
+    /// `perf_event_attr.type` (e.g. `PERF_TYPE_HARDWARE`, `PERF_TYPE_HW_CACHE`).
+    pub event_type: u32,
+    /// `perf_event_attr.config`.
+    pub config: u64,
+    /// A human-readable name, used to label the resulting counter track.
+    pub name: String,
+}
+
+impl ExtraEvent {
+    /// The `perf_event_attr` for opening this event as a counting-only sibling
+    /// in the group of a leader opened with `leader_attr`.
+    fn sibling_attr(&self, leader_attr: &PerfEventAttr) -> PerfEventAttr {
+        let mut attr: PerfEventAttr = unsafe { mem::zeroed() };
+        attr.size = mem::size_of::<PerfEventAttr>() as u32;
+        attr.kind = self.event_type;
+        attr.config = self.config;
+        // The sibling must use the same read_format as the leader so the
+        // grouped read layout is consistent across the group, and must match
+        // the leader's clock and inherit setting, otherwise perf_event_open
+        // rejects it with EINVAL. Counting only: sample_period_or_freq stays
+        // 0, so the sibling produces no records of its own and needs no ring
+        // buffer.
+        attr.read_format = leader_attr.read_format;
+        attr.clock_id = leader_attr.clock_id;
+        // Siblings are opened enabled, but a group is only scheduled onto the
+        // PMU while its leader is enabled, so the leader's disabled /
+        // enable_on_exec state gates the whole group. (Opening siblings
+        // disabled would be wrong: PERF_EVENT_IOC_ENABLE on the leader only
+        // enables the leader, and would leave the siblings off forever.)
+        attr.flags = leader_attr.flags & (PERF_ATTR_FLAG_EXCLUDE_KERNEL | PERF_ATTR_FLAG_INHERIT);
+        attr
+    }
+}
+
+/// Open `extra` as a counting-only sibling in `leader_fd`'s event group and
+/// read back its kernel-assigned id.
+fn open_sibling_event(
+    extra: &ExtraEvent,
+    leader_attr: &PerfEventAttr,
+    pid: pid_t,
+    cpu: c_int,
+    leader_fd: RawFd,
+) -> io::Result<SiblingEvent> {
+    let attr = extra.sibling_attr(leader_attr);
+    let fd = sys_perf_event_open(&attr, pid, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
+    if fd == -1 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!("failed to open extra event '{}': {err}", extra.name),
+        ));
+    }
+
+    let mut id: u64 = 0;
+    let ok = unsafe { libc::ioctl(fd, PERF_EVENT_IOC_ID as _, &mut id) };
+    if ok == -1 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(io::Error::new(
+            err.kind(),
+            format!("failed to read id of extra event '{}': {err}", extra.name),
+        ));
+    }
+
+    Ok(SiblingEvent {
+        fd,
+        id,
+        name: extra.name.clone(),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct PerfBuilder {
     pid: u32,
@@ -158,6 +273,7 @@ pub struct PerfBuilder {
     stack_size: u32,
     reg_mask: u64,
     event_source: EventSource,
+    extra_events: Vec<ExtraEvent>,
     inherit: bool,
     start_disabled: bool,
     enable_on_exec: bool,
@@ -204,6 +320,12 @@ impl PerfBuilder {
 
     pub fn event_source(mut self, event_source: EventSource) -> Self {
         self.event_source = event_source;
+        self
+    }
+
+    /// Attach extra counters to be read on every sample of the main event.
+    pub fn extra_events(mut self, extra_events: Vec<ExtraEvent>) -> Self {
+        self.extra_events = extra_events;
         self
     }
 
@@ -286,16 +408,9 @@ impl PerfBuilder {
         let mut attr: PerfEventAttr = unsafe { mem::zeroed() };
         attr.size = mem::size_of::<PerfEventAttr>() as u32;
 
-        match event_source {
-            EventSource::HwCpuCycles => {
-                attr.kind = PERF_TYPE_HARDWARE;
-                attr.config = PERF_COUNT_HW_CPU_CYCLES;
-            }
-            EventSource::SwCpuClock => {
-                attr.kind = PERF_TYPE_SOFTWARE;
-                attr.config = PERF_COUNT_SW_CPU_CLOCK;
-            }
-        }
+        let (event_type, event_config) = event_source.type_and_config();
+        attr.kind = event_type;
+        attr.config = event_config;
 
         attr.sample_type = PERF_SAMPLE_IP
             | PERF_SAMPLE_TID
@@ -309,6 +424,14 @@ impl PerfBuilder {
 
         if stack_size != 0 {
             attr.sample_type |= PERF_SAMPLE_STACK_USER;
+        }
+
+        // When extra events are requested, make this the leader of a kernel
+        // event group and have every sample carry the group's counter values,
+        // each tagged with its event's kernel-assigned id.
+        if !self.extra_events.is_empty() {
+            attr.sample_type |= PERF_SAMPLE_READ;
+            attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID;
         }
 
         attr.sample_regs_user = reg_mask;
@@ -401,12 +524,33 @@ impl PerfBuilder {
                 .unwrap();
         let parse_info = RecordParseInfo::new(&attr2, Endianness::NATIVE);
 
+        // Open each extra event as a counting-only sibling in the leader's
+        // event group. If any sibling fails to open, roll back the whole group
+        // so the caller can fall back to a simpler configuration.
+        let mut siblings: Vec<SiblingEvent> = Vec::with_capacity(self.extra_events.len());
+        for extra in &self.extra_events {
+            match open_sibling_event(extra, &attr, pid as pid_t, cpu as _, fd) {
+                Ok(sibling) => siblings.push(sibling),
+                Err(err) => {
+                    unsafe {
+                        for sibling in &siblings {
+                            libc::close(sibling.fd);
+                        }
+                        libc::munmap(buffer as *mut c_void, full_size);
+                        libc::close(fd);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
         // debug!("Perf events open with fd={}", fd);
         let mut perf = Perf {
             event_ref_state: Rc::new(RefCell::new(EventRefState::new(buffer, size))),
             buffer,
             size,
             fd,
+            siblings,
             position: 0,
             parse_info,
         };
@@ -433,6 +577,7 @@ impl Perf {
             stack_size: 0,
             reg_mask: 0,
             event_source: EventSource::SwCpuClock,
+            extra_events: Vec::new(),
             inherit: false,
             start_disabled: false,
             enable_on_exec: false,
@@ -442,6 +587,9 @@ impl Perf {
     }
 
     pub fn enable(&mut self) {
+        // This only enables the leader, but that is enough for the whole
+        // group: siblings are opened enabled and follow the leader's
+        // scheduling.
         let result = unsafe { libc::ioctl(self.fd, PERF_EVENT_IOC_ENABLE as _) };
 
         assert!(result != -1);
@@ -456,6 +604,14 @@ impl Perf {
     #[inline]
     pub fn fd(&self) -> RawFd {
         self.fd
+    }
+
+    /// The kernel-assigned id and name of each sibling event. The siblings'
+    /// per-sample values arrive via `SampleRecord::read`, matched by id.
+    pub fn siblings(&self) -> impl Iterator<Item = (u64, &str)> {
+        self.siblings
+            .iter()
+            .map(|sibling| (sibling.id, sibling.name.as_str()))
     }
 
     #[inline]

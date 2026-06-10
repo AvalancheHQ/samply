@@ -161,6 +161,7 @@ impl ThreadProfiler {
                 cpu_delta,
                 1,
                 None,
+                None,
             );
         } else {
             // No CPU time elapsed since just before the last time we grabbed a stack.

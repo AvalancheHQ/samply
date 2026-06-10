@@ -108,9 +108,27 @@ impl ProcessSampleData {
             let mut frames = StackDepthLimitingFrameIter::new(profile, frames, user_category);
             let stack_handle = profile.handle_for_stack_frames(move |p| frames.next(p));
             match sample_or_marker {
-                SampleOrMarker::Sample(SampleData { cpu_delta, weight }) => {
-                    profile.add_sample(thread_handle, timestamp, stack_handle, cpu_delta, weight);
-                }
+                SampleOrMarker::Sample(SampleData {
+                    cpu_delta,
+                    weight,
+                    extra_deltas,
+                }) => match extra_deltas {
+                    Some(extra_deltas) => profile.add_sample_with_extra_deltas(
+                        thread_handle,
+                        timestamp,
+                        stack_handle,
+                        cpu_delta,
+                        weight,
+                        &extra_deltas,
+                    ),
+                    None => profile.add_sample(
+                        thread_handle,
+                        timestamp,
+                        stack_handle,
+                        cpu_delta,
+                        weight,
+                    ),
+                },
                 SampleOrMarker::MarkerHandle(mh) => {
                     profile.set_marker_stack(thread_handle, mh, stack_handle);
                 }

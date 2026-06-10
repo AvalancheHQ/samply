@@ -201,6 +201,9 @@ pub struct Profile {
     pub(crate) symbolicated: bool,
     used_pids: FastHashMap<u32, u32>,
     used_tids: FastHashMap<u32, u32>,
+    /// Names of the extra per-sample delta columns, shared by all threads.
+    /// Must be set before any call to [`Profile::add_sample_with_extra_deltas`].
+    extra_sample_delta_names: Option<Arc<[String]>>,
 }
 
 impl Profile {
@@ -237,6 +240,7 @@ impl Profile {
             symbolicated: false,
             used_pids: FastHashMap::default(),
             used_tids: FastHashMap::default(),
+            extra_sample_delta_names: None,
             counters: Vec::new(),
         }
     }
@@ -865,6 +869,43 @@ impl Profile {
         self.threads[thread.0].add_sample(timestamp, stack, cpu_delta, weight);
     }
 
+    /// Register the names of the extra per-sample delta columns, shared by all
+    /// threads. Must be called before [`Profile::add_sample_with_extra_deltas`].
+    pub fn set_extra_sample_delta_names(&mut self, names: Vec<String>) {
+        self.extra_sample_delta_names = Some(names.into());
+    }
+
+    /// Like [`Profile::add_sample`], but also records a value for each extra
+    /// per-sample delta column registered with
+    /// [`Profile::set_extra_sample_delta_names`], in registration order.
+    /// `None` entries are serialized as `null` ("no value carried by this
+    /// sample"), distinguishing them from an actual delta of zero.
+    pub fn add_sample_with_extra_deltas(
+        &mut self,
+        thread: ThreadHandle,
+        timestamp: Timestamp,
+        stack: Option<StackHandle>,
+        cpu_delta: CpuDelta,
+        weight: i32,
+        extra_deltas: &[Option<u64>],
+    ) {
+        let names = self
+            .extra_sample_delta_names
+            .as_ref()
+            .expect(
+                "set_extra_sample_delta_names must be called before add_sample_with_extra_deltas",
+            )
+            .clone();
+        self.threads[thread.0].add_sample_with_extra_deltas(
+            timestamp,
+            stack,
+            cpu_delta,
+            weight,
+            &names,
+            extra_deltas,
+        );
+    }
+
     /// Add a sample with a CPU delta of zero. Internally, multiple consecutive
     /// samples with a delta of zero will be combined into one sample with an accumulated
     /// weight.
@@ -1180,6 +1221,7 @@ impl Profile {
             symbolicated,
             used_pids,
             used_tids,
+            extra_sample_delta_names,
         } = self;
 
         let (shared_data, old_stack_to_new_stack) =
@@ -1212,6 +1254,7 @@ impl Profile {
             symbolicated,
             used_pids,
             used_tids,
+            extra_sample_delta_names,
         }
     }
 

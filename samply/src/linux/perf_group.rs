@@ -10,7 +10,7 @@ use linux_perf_data::linux_perf_event_reader::get_record_timestamp;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 
-use super::perf_event::{EventRef, EventSource, Perf};
+use super::perf_event::{EventRef, EventSource, ExtraEvent, Perf};
 use super::sorter::EventSorter;
 
 struct StoppedProcess(u32);
@@ -36,6 +36,7 @@ impl Drop for StoppedProcess {
     }
 }
 
+/// One sampling perf event with its ring buffer.
 struct Member {
     perf: Perf,
     is_closed: bool,
@@ -63,8 +64,15 @@ impl DerefMut for Member {
     }
 }
 
+/// The perf events opened for one profiling session, together with the
+/// machinery to poll their ring buffers and merge the records into one
+/// time-ordered stream.
+///
+/// Despite the name, this is not a kernel event group: its members are
+/// independent sampling events.
 pub struct PerfGroup {
     event_sorter: EventSorter<RawFd, u64, EventRef>,
+    /// One sampling event per ring buffer, keyed by fd.
     members: BTreeMap<RawFd, Member>,
     poll: Poll,
     poll_events: Events,
@@ -72,6 +80,7 @@ pub struct PerfGroup {
     stack_size: u32,
     regs_mask: u64,
     event_source: EventSource,
+    extra_events: Vec<ExtraEvent>,
     stopped_processes: Vec<StoppedProcess>,
 }
 
@@ -98,7 +107,13 @@ pub enum AttachMode {
 }
 
 impl PerfGroup {
-    pub fn new(frequency: u32, stack_size: u32, regs_mask: u64, event_source: EventSource) -> Self {
+    pub fn new(
+        frequency: u32,
+        stack_size: u32,
+        regs_mask: u64,
+        event_source: EventSource,
+        extra_events: Vec<ExtraEvent>,
+    ) -> Self {
         PerfGroup {
             event_sorter: EventSorter::new(),
             members: Default::default(),
@@ -107,6 +122,7 @@ impl PerfGroup {
             frequency,
             stack_size,
             event_source,
+            extra_events,
             regs_mask,
             stopped_processes: Vec::new(),
         }
@@ -119,8 +135,10 @@ impl PerfGroup {
         event_source: EventSource,
         regs_mask: u64,
         attach_mode: AttachMode,
+        extra_events: Vec<ExtraEvent>,
     ) -> Result<Self, io::Error> {
-        let mut group = PerfGroup::new(frequency, stack_size, regs_mask, event_source);
+        let mut group =
+            PerfGroup::new(frequency, stack_size, regs_mask, event_source, extra_events);
         group.open_process(pid, attach_mode)?;
         Ok(group)
     }
@@ -141,6 +159,7 @@ impl PerfGroup {
                 .sample_kernel()
                 .gather_context_switches()
                 .event_source(self.event_source)
+                .extra_events(self.extra_events.clone())
                 .start_disabled();
             if let Some(cpu) = cpu {
                 builder = builder.only_cpu(cpu).inherit_to_children();
@@ -184,6 +203,16 @@ impl PerfGroup {
         }
 
         Ok(())
+    }
+
+    /// The (kernel-assigned id, name) of every sibling event, across all
+    /// members. Each member's kernel event group has its own siblings, so
+    /// several ids share a name.
+    pub fn extra_event_ids_and_names(&self) -> Vec<(u64, String)> {
+        self.members
+            .values()
+            .flat_map(|member| member.siblings().map(|(id, name)| (id, name.to_owned())))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {

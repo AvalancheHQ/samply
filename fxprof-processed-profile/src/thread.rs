@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use serde::ser::{SerializeMap, Serializer};
 
@@ -83,6 +84,28 @@ impl Thread {
     ) {
         self.samples
             .add_sample(timestamp, stack_index, cpu_delta, weight);
+        self.last_sample_stack = stack_index;
+        self.last_sample_was_zero_cpu = cpu_delta == CpuDelta::ZERO;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_sample_with_extra_deltas(
+        &mut self,
+        timestamp: Timestamp,
+        stack_index: Option<StackHandle>,
+        cpu_delta: CpuDelta,
+        weight: i32,
+        extra_delta_names: &Arc<[String]>,
+        extra_deltas: &[Option<u64>],
+    ) {
+        self.samples.add_sample_with_extra_deltas(
+            timestamp,
+            stack_index,
+            cpu_delta,
+            weight,
+            extra_delta_names,
+            extra_deltas,
+        );
         self.last_sample_stack = stack_index;
         self.last_sample_was_zero_cpu = cpu_delta == CpuDelta::ZERO;
     }

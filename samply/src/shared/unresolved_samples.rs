@@ -38,6 +38,7 @@ impl UnresolvedSamples {
         cpu_delta: CpuDelta,
         weight: i32,
         extra_label_frame: Option<FrameHandle>,
+        extra_deltas: Option<Vec<Option<u64>>>,
     ) {
         let sample_index = self.samples_and_markers.len();
         self.samples_and_markers.push(UnresolvedSampleOrMarker {
@@ -46,7 +47,11 @@ impl UnresolvedSamples {
             timestamp_mono,
             stack,
             extra_label_frame,
-            sample_or_marker: SampleOrMarker::Sample(SampleData { weight, cpu_delta }),
+            sample_or_marker: SampleOrMarker::Sample(SampleData {
+                weight,
+                cpu_delta,
+                extra_deltas,
+            }),
         });
         self.prev_sample_info_per_thread.insert(
             thread_handle,
@@ -89,6 +94,7 @@ impl UnresolvedSamples {
                         sample_or_marker: SampleOrMarker::Sample(SampleData {
                             weight,
                             cpu_delta: CpuDelta::ZERO,
+                            extra_deltas: None,
                         }),
                     });
                     sample_info.prev_sample_index_if_zero_cpu = Some(sample_index);
@@ -106,6 +112,7 @@ impl UnresolvedSamples {
                     sample_or_marker: SampleOrMarker::Sample(SampleData {
                         weight,
                         cpu_delta: CpuDelta::ZERO,
+                        extra_deltas: None,
                     }),
                 });
                 entry.insert(PreviousSampleInfo {
@@ -155,6 +162,9 @@ pub enum SampleOrMarker {
 pub struct SampleData {
     pub cpu_delta: CpuDelta,
     pub weight: i32,
+    /// Values for the profile's extra per-sample delta columns, in column
+    /// order. `None` entries mean the sample carries no value for that column.
+    pub extra_deltas: Option<Vec<Option<u64>>>,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]

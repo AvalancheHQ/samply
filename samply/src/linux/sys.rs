@@ -23,6 +23,7 @@ pub const PERF_FLAG_FD_CLOEXEC: c_ulong = 1 << 3;
 pub const PERF_TYPE_HARDWARE: u32 = 0;
 pub const PERF_TYPE_SOFTWARE: u32 = 1;
 pub const PERF_TYPE_TRACEPOINT: u32 = 2;
+pub const PERF_TYPE_HW_CACHE: u32 = 3;
 
 pub const PERF_ATTR_FLAG_DISABLED: u64 = flag!(0);
 pub const PERF_ATTR_FLAG_INHERIT: u64 = flag!(1);
@@ -51,12 +52,37 @@ pub const PERF_ATTR_FLAG_USE_CLOCKID: u64 = flag!(25);
 pub const PERF_ATTR_FLAG_CONTEX_SWITCH: u64 = flag!(26);
 
 pub const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+pub const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+pub const PERF_COUNT_HW_CACHE_REFERENCES: u64 = 2;
+pub const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
+pub const PERF_COUNT_HW_BRANCH_INSTRUCTIONS: u64 = 4;
+pub const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
 pub const PERF_COUNT_HW_REF_CPU_CYCLES: u64 = 9;
 
 pub const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
 pub const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
 pub const PERF_COUNT_SW_PAGE_FAULTS: u64 = 2;
 pub const PERF_COUNT_SW_DUMMY: u64 = 9;
+
+// PERF_TYPE_HW_CACHE config is a packed triple:
+//   (cache_id) | (op_id << 8) | (op_result_id << 16)
+// See `enum perf_hw_cache_id` / `_op_id` / `_op_result_id` in <linux/perf_event.h>.
+pub const PERF_COUNT_HW_CACHE_L1D: u64 = 0;
+pub const PERF_COUNT_HW_CACHE_OP_READ: u64 = 0;
+pub const PERF_COUNT_HW_CACHE_RESULT_ACCESS: u64 = 0;
+pub const PERF_COUNT_HW_CACHE_RESULT_MISS: u64 = 1;
+
+/// Pack a `PERF_TYPE_HW_CACHE` config value from its cache/op/result parts.
+pub const fn hw_cache_config(cache_id: u64, op_id: u64, result_id: u64) -> u64 {
+    cache_id | (op_id << 8) | (result_id << 16)
+}
+
+// `read_format` bits — control the layout of the values delivered by
+// PERF_SAMPLE_READ. See `enum perf_event_read_format` in <linux/perf_event.h>.
+pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+pub const PERF_FORMAT_ID: u64 = 1 << 2;
+pub const PERF_FORMAT_GROUP: u64 = 1 << 3;
 
 pub const PERF_RECORD_LOST: u32 = 2;
 pub const PERF_RECORD_COMM: u32 = 3;
@@ -222,6 +248,7 @@ mod ioctl {
         pub const IOC_SIZEBITS: c_ulong = 14;
         pub const IOC_DIRBITS: c_ulong = 2;
         pub const IOC_NONE: c_ulong = 0;
+        pub const IOC_READ: c_ulong = 2;
     }
 
     #[cfg(any(
@@ -236,6 +263,7 @@ mod ioctl {
         pub const IOC_SIZEBITS: c_ulong = 13;
         pub const IOC_DIRBITS: c_ulong = 3;
         pub const IOC_NONE: c_ulong = 1;
+        pub const IOC_READ: c_ulong = 2;
     }
 
     pub use self::arch::*;
@@ -263,8 +291,18 @@ macro_rules! io {
     };
 }
 
+macro_rules! ior {
+    ($kind:expr, $nr:expr, $size:expr) => {
+        ioc!(ioctl::IOC_READ, $kind, $nr, $size as c_ulong)
+    };
+}
+
 pub const PERF_EVENT_IOC_ENABLE: c_ulong = io!(b'$', 0);
 pub const PERF_EVENT_IOC_DISABLE: c_ulong = io!(b'$', 1);
+// _IOR('$', 7, __u64 *): reads back the kernel-assigned id for this event, used
+// to map PERF_SAMPLE_READ group values to the event that produced them. The
+// argument type is a pointer, so the encoded size is the pointer size.
+pub const PERF_EVENT_IOC_ID: c_ulong = ior!(b'$', 7, std::mem::size_of::<*mut u64>());
 
 #[repr(C)]
 pub struct PerfEventAttr {

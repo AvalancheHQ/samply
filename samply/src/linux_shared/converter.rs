@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,7 @@ use super::injected_jit_object::{correct_bad_perf_jit_so_file, jit_function_name
 use super::kernel_symbols::{kernel_module_build_id, KernelSymbols};
 use super::mmap_range_or_vec::MmapRangeOrVec;
 use super::pe_mappings::{PeMappings, SuspectedPeMapping};
+use super::process::ExtraEventInstance;
 use super::processes::Processes;
 use super::rss_stat::{RssStat, MM_ANONPAGES, MM_FILEPAGES, MM_SHMEMPAGES, MM_SWAPENTS};
 use super::svma_file_range::compute_vma_bias;
@@ -110,6 +112,14 @@ where
 
     /// Whether to emit context switch markers.
     should_emit_cswitch_markers: bool,
+
+    /// The extra per-sample delta dimension for each extra perf event that
+    /// rides along on the main sampling event, keyed by the event's
+    /// kernel-assigned id. Several ids map to the same dimension (one sibling
+    /// instance per event group). Filled once before any record is processed.
+    extra_event_dim_by_id: HashMap<u64, usize>,
+    /// The number of extra per-sample delta dimensions.
+    extra_event_dim_count: usize,
 }
 
 struct SimpleperfConverterData {
@@ -219,6 +229,30 @@ where
             call_chain_return_addresses_are_preadjusted,
             should_emit_jit_markers: profile_creation_props.should_emit_jit_markers,
             should_emit_cswitch_markers: profile_creation_props.should_emit_cswitch_markers,
+            extra_event_dim_by_id: HashMap::new(),
+            extra_event_dim_count: 0,
+        }
+    }
+
+    /// Register the extra perf events that ride along on the main sampling
+    /// event, as (kernel-assigned id, name) pairs. Their per-sample values
+    /// become extra per-sample delta columns in the output profile; events
+    /// sharing a name share a column.
+    pub fn set_extra_events(&mut self, ids_and_names: Vec<(u64, String)>) {
+        let mut dim_names: Vec<String> = Vec::new();
+        for (id, name) in ids_and_names {
+            let dim = dim_names
+                .iter()
+                .position(|n| *n == name)
+                .unwrap_or_else(|| {
+                    dim_names.push(name);
+                    dim_names.len() - 1
+                });
+            self.extra_event_dim_by_id.insert(id, dim);
+        }
+        self.extra_event_dim_count = dim_names.len();
+        if !dim_names.is_empty() {
+            self.profile.set_extra_sample_delta_names(dim_names);
         }
     }
 
@@ -323,6 +357,38 @@ where
             CpuDelta::from_nanos(0)
         };
 
+        // Turn the group-read values carried by this sample into extra
+        // per-sample deltas. The raw values are cumulative per counter
+        // instance, and the kernel keeps one instance per (event group,
+        // thread): ids are per group, and with `inherit` every thread has its
+        // own instance sharing the group's id. So the delta is taken against
+        // the previous value of the same (id, tid) pair; the first observation
+        // of a pair only records the baseline and leaves the column empty.
+        let extra_deltas = e.read.as_ref().map(|read| {
+            let mut extra_deltas: Vec<Option<u64>> = vec![None; self.extra_event_dim_count];
+            for value in &read.values {
+                let Some(id) = value.id else { continue };
+                match process.extra_event_instances.entry((id, tid)) {
+                    Entry::Occupied(mut entry) => {
+                        let instance = entry.get_mut();
+                        extra_deltas[instance.dim] =
+                            Some(value.value.saturating_sub(instance.prev_value));
+                        instance.prev_value = value.value;
+                    }
+                    Entry::Vacant(entry) => {
+                        // Ids we don't know (e.g. the leader's own) are skipped.
+                        if let Some(&dim) = self.extra_event_dim_by_id.get(&id) {
+                            entry.insert(ExtraEventInstance {
+                                dim,
+                                prev_value: value.value,
+                            });
+                        }
+                    }
+                }
+            }
+            extra_deltas
+        });
+
         let stack_index = self.unresolved_stacks.convert(stack.iter().rev().cloned());
         process.unresolved_samples.add_sample(
             thread_handle,
@@ -332,6 +398,7 @@ where
             cpu_delta,
             1,
             None,
+            extra_deltas,
         );
 
         if let (Some(cpu_index), Some(cpus)) = (e.cpu, &mut self.cpus) {
@@ -366,6 +433,7 @@ where
                 cpu_delta,
                 1,
                 Some(label_frame),
+                None,
             );
 
             let label_frame = self.profile.handle_for_frame_with_label(
@@ -381,6 +449,7 @@ where
                 CpuDelta::ZERO,
                 1,
                 Some(label_frame),
+                None,
             );
         }
     }
@@ -928,6 +997,7 @@ where
                             cpu_delta,
                             0,
                             Some(cpu.idle_frame),
+                            None,
                         );
 
                         // Emit a "rest sample" with a CPU delta of zero covering the rest of the paused range.
@@ -942,6 +1012,7 @@ where
                             CpuDelta::from_nanos(0),
                             0,
                             Some(cpu.idle_frame),
+                            None,
                         );
                     }
                     if self.should_emit_cswitch_markers {
@@ -1862,6 +1933,7 @@ fn process_off_cpu_sample_group(
         cpu_delta,
         weight,
         None,
+        None,
     );
 
     if sample_count > 1 {
@@ -1876,6 +1948,7 @@ fn process_off_cpu_sample_group(
             stack,
             cpu_delta,
             weight,
+            None,
             None,
         );
     }

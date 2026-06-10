@@ -14,7 +14,7 @@ use linux_perf_data::linux_perf_event_reader::{
 use nix::sys::wait::WaitStatus;
 use tokio::sync::oneshot;
 
-use super::perf_event::{EventRef, EventSource};
+use super::perf_event::{EventRef, EventSource, ExtraEvent};
 use super::perf_group::{AttachMode, PerfGroup};
 use super::proc_maps;
 use super::process::SuspendedLaunchedProcess;
@@ -385,14 +385,40 @@ fn init_profiler(
     let stack_size = 32000;
     let regs_mask = ConvertRegsNative::regs_mask();
 
-    let perf = PerfGroup::open(
+    // Extra hardware counters read on every sample, in addition to the main
+    // sampling event. These are PMU events, so they are only attempted on the
+    // hardware-cycles path; in environments where hardware cycles aren't
+    // available (e.g. VMs) these typically aren't either.
+    let extra_events: Vec<ExtraEvent> = Vec::new();
+
+    let mut perf = PerfGroup::open(
         pid,
         frequency,
         stack_size,
         EventSource::HwCpuCycles,
         regs_mask,
         attach_mode,
+        extra_events.clone(),
     );
+
+    if perf.is_err() && !extra_events.is_empty() {
+        // The extra counters can be unavailable even where cycles sampling
+        // works: the PMU may not expose them, and grouped reads of inherited
+        // events (PERF_SAMPLE_READ + inherit) require Linux 6.12. Retry
+        // without the extra counters before giving up on hardware cycles.
+        perf = PerfGroup::open(
+            pid,
+            frequency,
+            stack_size,
+            EventSource::HwCpuCycles,
+            regs_mask,
+            attach_mode,
+            Vec::new(),
+        );
+        if perf.is_ok() {
+            eprintln!("Couldn't open the extra perf events; continuing without extra counters.");
+        }
+    }
 
     let mut perf = match perf {
         Ok(perf) => perf,
@@ -406,6 +432,7 @@ fn init_profiler(
                 EventSource::SwCpuClock,
                 regs_mask,
                 attach_mode,
+                Vec::new(),
             );
             match perf {
                 Ok(perf) => perf, // Success!
@@ -435,6 +462,10 @@ fn init_profiler(
             }
         }
     };
+
+    // Tell the converter which extra events are attached, so it can turn their
+    // per-sample group-read values into extra per-sample delta columns.
+    converter.set_extra_events(perf.extra_event_ids_and_names());
 
     let (exe_name, cmdline) = get_process_cmdline(pid).expect("Couldn't read process cmdline");
     let comm_data = std::fs::read(format!("/proc/{pid}/comm")).expect("Couldn't read process comm");

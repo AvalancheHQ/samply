@@ -1139,6 +1139,7 @@ impl ProfileContext {
             cpu_delta,
             1,
             None,
+            None,
         );
     }
 
@@ -1291,6 +1292,7 @@ impl ProfileContext {
                 cpu_delta,
                 1,
                 None,
+                None,
             );
             cpu_delta = CpuDelta::ZERO;
 
@@ -1305,6 +1307,7 @@ impl ProfileContext {
                     user_stack_index,
                     CpuDelta::ZERO,
                     weight,
+                    None,
                     None,
                 );
             }
@@ -1328,6 +1331,7 @@ impl ProfileContext {
             cpu_delta,
             1,
             None,
+            None,
         );
 
         if let Some((cpu_thread_handle, cpu_delta)) = per_cpu_stuff {
@@ -1344,6 +1348,7 @@ impl ProfileContext {
                 cpu_delta,
                 1,
                 Some(thread_label_frame),
+                None,
             );
             process.unresolved_samples.add_sample(
                 self.cpus.as_ref().unwrap().combined_thread_handle(),
@@ -1353,6 +1358,7 @@ impl ProfileContext {
                 CpuDelta::ZERO,
                 1,
                 Some(thread_label_frame),
+                None,
             );
         }
 
