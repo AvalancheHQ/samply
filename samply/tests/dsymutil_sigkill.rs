@@ -25,7 +25,10 @@ use std::path::Path;
 use std::process::Command;
 
 fn cc(args: &[&str]) {
-    let status = Command::new("cc").args(args).status().expect("failed to run cc");
+    let status = Command::new("cc")
+        .args(args)
+        .status()
+        .expect("failed to run cc");
     assert!(status.success(), "cc {args:?} failed");
 }
 
@@ -52,8 +55,17 @@ fn dsymutil_is_not_killed_under_samply() {
         use std::fmt::Write as _;
         let mut s = String::from("#include <cstdio>\n");
         for i in 0..1200 {
-            writeln!(s, "template<int N> struct S{i} {{ int v[N%7+1]; int f(int x){{return x*{i}+N;}} }};").unwrap();
-            writeln!(s, "int g{i}(int x){{ S{i}<{}> s; return s.f(x)+{i}; }}", i % 9 + 1).unwrap();
+            writeln!(
+                s,
+                "template<int N> struct S{i} {{ int v[N%7+1]; int f(int x){{return x*{i}+N;}} }};"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "int g{i}(int x){{ S{i}<{}> s; return s.f(x)+{i}; }}",
+                i % 9 + 1
+            )
+            .unwrap();
         }
         s.push_str("int main(){int t=0;");
         for i in 0..1200 {
@@ -63,7 +75,13 @@ fn dsymutil_is_not_killed_under_samply() {
         std::fs::write(&src, s).unwrap();
     }
     let macho = tmp.join("bigcpp");
-    cc(&["-g", "-O0", "-o", macho.to_str().unwrap(), src.to_str().unwrap()]);
+    cc(&[
+        "-g",
+        "-O0",
+        "-o",
+        macho.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
 
     // A locally-built (non-restricted) parent that execs dsymutil and reports
     // how the child died via its own exit code: 0 = clean, 1 = killed by signal.
@@ -86,7 +104,12 @@ int main(int argc, char** argv){
     )
     .unwrap();
     let spawner = tmp.join("spawner");
-    cc(&["-O0", "-o", spawner.to_str().unwrap(), spawner_src.to_str().unwrap()]);
+    cc(&[
+        "-O0",
+        "-o",
+        spawner.to_str().unwrap(),
+        spawner_src.to_str().unwrap(),
+    ]);
 
     let out_dwarf = tmp.join("out.dwarf");
     let profile = tmp.join("profile.json.gz");
