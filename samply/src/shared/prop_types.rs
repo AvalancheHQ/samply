@@ -33,6 +33,10 @@ pub struct RecordingProps {
     pub output_file: PathBuf,
     pub time_limit: Option<Duration>,
     pub interval: Duration,
+    /// Names of extra perf events to record alongside the main sampling
+    /// event. Only used on Linux.
+    #[allow(dead_code)]
+    pub perf_events: Vec<String>,
     #[allow(dead_code)]
     pub vm_hack: bool,
     #[allow(dead_code)]

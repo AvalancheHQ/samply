@@ -205,13 +205,17 @@ impl PerfGroup {
         Ok(())
     }
 
-    /// The (kernel-assigned id, name) of every sibling event, across all
-    /// members. Each member's kernel event group has its own siblings, so
+    /// The (kernel-assigned id, name) of every extra event, across all
+    /// members. Each member's kernel event group has its own instances, so
     /// several ids share a name.
     pub fn extra_event_ids_and_names(&self) -> Vec<(u64, String)> {
         self.members
             .values()
-            .flat_map(|member| member.siblings().map(|(id, name)| (id, name.to_owned())))
+            .flat_map(|member| {
+                member
+                    .extra_event_ids()
+                    .map(|(id, name)| (id, name.to_owned()))
+            })
             .collect()
     }
 

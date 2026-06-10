@@ -92,6 +92,9 @@ pub fn run(
     // Launch the observer thread. This thread will manage the perf events.
     let interval = recording_props.interval;
     let time_limit = recording_props.time_limit;
+    // Resolve the extra event names before launching anything, so that a
+    // configuration error aborts immediately.
+    let extra_events = resolve_extra_events(&recording_props.perf_events);
     let initial_exec_name = command_name.to_string_lossy().to_string();
     let initial_cmdline: Vec<String> = std::iter::once(initial_exec_name.clone())
         .chain(args.iter().map(|arg| arg.to_string_lossy().to_string()))
@@ -112,7 +115,7 @@ pub fn run(
         };
 
         // Create the perf events, setting ENABLE_ON_EXEC.
-        let perf_group = init_profiler(interval, pid, attach_mode, &mut converter);
+        let perf_group = init_profiler(interval, pid, attach_mode, extra_events, &mut converter);
 
         // Tell the main thread to tell the child process to begin executing.
         profile_another_pid_reply_sender.send(true).unwrap();
@@ -254,6 +257,10 @@ fn start_profiling_pid(
     let (profile_another_pid_reply_sender, profile_another_pid_reply_receiver) =
         crossbeam_channel::bounded(2);
 
+    // Resolve the extra event names before launching anything, so that a
+    // configuration error aborts immediately.
+    let extra_events = resolve_extra_events(&recording_props.perf_events);
+
     let observer_thread = thread::spawn({
         move || {
             let interval = recording_props.interval;
@@ -264,7 +271,8 @@ fn start_profiling_pid(
             else {
                 panic!("The first message should be a StartProfilingAnotherProcess")
             };
-            let perf_group = init_profiler(interval, pid, attach_mode, &mut converter);
+            let perf_group =
+                init_profiler(interval, pid, attach_mode, extra_events, &mut converter);
 
             // Tell the main thread that we are now executing.
             profile_another_pid_reply_sender.send(true).unwrap();
@@ -367,10 +375,27 @@ fn make_converter(
     converter
 }
 
+/// Parse `<name>:<type>:<config>` event specs into extra events to open
+/// alongside the main sampling event. Malformed specs are a configuration
+/// error and abort.
+fn resolve_extra_events(specs: &[String]) -> Vec<ExtraEvent> {
+    specs
+        .iter()
+        .map(|spec| match spec.parse() {
+            Ok(event) => event,
+            Err(err) => {
+                eprintln!("Error: invalid perf event spec: {err}");
+                std::process::exit(1);
+            }
+        })
+        .collect()
+}
+
 fn init_profiler(
     interval: Duration,
     pid: u32,
     attach_mode: AttachMode,
+    extra_events: Vec<ExtraEvent>,
     converter: &mut Converter<
         framehop::UnwinderNative<MmapRangeOrVec, framehop::MayAllocateDuringUnwind>,
     >,
@@ -384,12 +409,6 @@ fn init_profiler(
     let frequency = (1_000_000_000 / interval_nanos) as u32;
     let stack_size = 32000;
     let regs_mask = ConvertRegsNative::regs_mask();
-
-    // Extra hardware counters read on every sample, in addition to the main
-    // sampling event. These are PMU events, so they are only attempted on the
-    // hardware-cycles path; in environments where hardware cycles aren't
-    // available (e.g. VMs) these typically aren't either.
-    let extra_events: Vec<ExtraEvent> = Vec::new();
 
     let mut perf = PerfGroup::open(
         pid,

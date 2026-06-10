@@ -141,6 +141,19 @@ pub struct RecordArgs {
     #[arg(long, default_value = "1")]
     pub iteration_count: u32,
 
+    /// Extra perf events to record alongside the main sampling event, as a
+    /// comma-separated list of `<name>:<type>:<config>` specs (e.g.
+    /// "instructions:0:0x1,l1d_access:4:0x0729"). `<type>` and `<config>` are
+    /// the raw `perf_event_attr` type and config values; `<name>` labels the
+    /// per-sample delta column stored in the profile. Linux only.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "NAME:TYPE:CONFIG,...",
+        env = "SAMPLY_PERF_EVENTS"
+    )]
+    pub perf_events: Vec<String>,
+
     /// Ignore exit code and continue running when iteration_count > 0
     #[arg(short, long)]
     pub ignore_exit_code: bool,
@@ -429,10 +442,21 @@ impl RecordArgs {
             std::process::exit(1);
         }
         let interval = Duration::from_secs_f64(1.0 / self.rate);
+        let perf_events: Vec<String> = self
+            .perf_events
+            .iter()
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .collect();
+        #[cfg(not(target_os = "linux"))]
+        if !perf_events.is_empty() {
+            eprintln!("Warning: --perf-events is only supported on Linux; ignoring.");
+        }
         RecordingProps {
             output_file: self.output.clone(),
             time_limit,
             interval,
+            perf_events,
             gfx: self.gfx,
             browsers: self.browsers,
             #[cfg(target_os = "windows")]

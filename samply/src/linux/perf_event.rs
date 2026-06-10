@@ -105,6 +105,12 @@ pub struct Perf {
     /// Sibling events of this event's kernel event group. Empty unless extra
     /// events were requested.
     siblings: Vec<SiblingEvent>,
+    /// The leader's own kernel-assigned id and the name it was requested
+    /// under, when one of the extra events has the same encoding as the
+    /// sampling event itself (e.g. `cpu-cycles` on the cycles leader). The
+    /// leader's value is part of every group read anyway, so such an event
+    /// needs no sibling — and no PMU counter — of its own.
+    leader_alias: Option<(u64, String)>,
     position: u64,
     parse_info: RecordParseInfo,
 }
@@ -192,12 +198,46 @@ impl EventSource {
 /// gives the number of events that occurred since the previous sample.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ExtraEvent {
-    /// `perf_event_attr.type` (e.g. `PERF_TYPE_HARDWARE`, `PERF_TYPE_HW_CACHE`).
+    /// `perf_event_attr.type` (e.g. `PERF_TYPE_HARDWARE`, `PERF_TYPE_RAW`).
     pub event_type: u32,
     /// `perf_event_attr.config`.
     pub config: u64,
     /// A human-readable name, used to label the resulting counter track.
     pub name: String,
+}
+
+impl std::str::FromStr for ExtraEvent {
+    type Err = String;
+
+    /// Parse a `<name>:<type>:<config>` event spec, e.g. `instructions:0:0x1`
+    /// or `l1d_access:4:0x0729`. `<type>` and `<config>` go verbatim into
+    /// `perf_event_attr.type` / `.config` (decimal or `0x`-prefixed hex);
+    /// resolving an event name to its encoding is the caller's job. `<name>`
+    /// labels the resulting counter column.
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let err = || format!("expected '<name>:<type>:<config>', got '{spec}'");
+        let (rest, config) = spec.rsplit_once(':').ok_or_else(err)?;
+        let (name, event_type) = rest.rsplit_once(':').ok_or_else(err)?;
+        if name.is_empty() {
+            return Err(err());
+        }
+        Ok(ExtraEvent {
+            event_type: parse_u32(event_type).ok_or_else(err)?,
+            config: parse_u64(config).ok_or_else(err)?,
+            name: name.to_owned(),
+        })
+    }
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => value.parse().ok(),
+    }
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    parse_u64(value)?.try_into().ok()
 }
 
 impl ExtraEvent {
@@ -238,31 +278,32 @@ fn open_sibling_event(
     let attr = extra.sibling_attr(leader_attr);
     let fd = sys_perf_event_open(&attr, pid, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
     if fd == -1 {
-        let err = io::Error::last_os_error();
-        return Err(io::Error::new(
-            err.kind(),
-            format!("failed to open extra event '{}': {err}", extra.name),
-        ));
+        return Err(io::Error::last_os_error());
     }
 
+    match read_event_id(fd) {
+        Ok(id) => Ok(SiblingEvent {
+            fd,
+            id,
+            name: extra.name.clone(),
+        }),
+        Err(err) => {
+            unsafe {
+                libc::close(fd);
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Read the kernel-assigned id of the event behind `fd`.
+fn read_event_id(fd: RawFd) -> io::Result<u64> {
     let mut id: u64 = 0;
     let ok = unsafe { libc::ioctl(fd, PERF_EVENT_IOC_ID as _, &mut id) };
     if ok == -1 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(io::Error::new(
-            err.kind(),
-            format!("failed to read id of extra event '{}': {err}", extra.name),
-        ));
+        return Err(io::Error::last_os_error());
     }
-
-    Ok(SiblingEvent {
-        fd,
-        id,
-        name: extra.name.clone(),
-    })
+    Ok(id)
 }
 
 #[derive(Clone, Debug)]
@@ -525,22 +566,33 @@ impl PerfBuilder {
         let parse_info = RecordParseInfo::new(&attr2, Endianness::NATIVE);
 
         // Open each extra event as a counting-only sibling in the leader's
-        // event group. If any sibling fails to open, roll back the whole group
-        // so the caller can fall back to a simpler configuration.
+        // event group. An extra event with the same encoding as the leader is
+        // aliased to the leader instead of opening a redundant sibling. If
+        // anything fails, roll back the whole group so the caller can fall
+        // back to a simpler configuration.
         let mut siblings: Vec<SiblingEvent> = Vec::with_capacity(self.extra_events.len());
+        let mut leader_alias: Option<(u64, String)> = None;
         for extra in &self.extra_events {
-            match open_sibling_event(extra, &attr, pid as pid_t, cpu as _, fd) {
-                Ok(sibling) => siblings.push(sibling),
-                Err(err) => {
-                    unsafe {
-                        for sibling in &siblings {
-                            libc::close(sibling.fd);
-                        }
-                        libc::munmap(buffer as *mut c_void, full_size);
-                        libc::close(fd);
+            let aliases_leader = leader_alias.is_none()
+                && (extra.event_type, extra.config) == (event_type, event_config);
+            let result = if aliases_leader {
+                read_event_id(fd).map(|id| leader_alias = Some((id, extra.name.clone())))
+            } else {
+                open_sibling_event(extra, &attr, pid as pid_t, cpu as _, fd)
+                    .map(|sibling| siblings.push(sibling))
+            };
+            if let Err(err) = result {
+                unsafe {
+                    for sibling in &siblings {
+                        libc::close(sibling.fd);
                     }
-                    return Err(err);
+                    libc::munmap(buffer as *mut c_void, full_size);
+                    libc::close(fd);
                 }
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("failed to open extra event '{}': {err}", extra.name),
+                ));
             }
         }
 
@@ -551,6 +603,7 @@ impl PerfBuilder {
             size,
             fd,
             siblings,
+            leader_alias,
             position: 0,
             parse_info,
         };
@@ -606,12 +659,19 @@ impl Perf {
         self.fd
     }
 
-    /// The kernel-assigned id and name of each sibling event. The siblings'
-    /// per-sample values arrive via `SampleRecord::read`, matched by id.
-    pub fn siblings(&self) -> impl Iterator<Item = (u64, &str)> {
-        self.siblings
+    /// The kernel-assigned id and name of each extra event readable from this
+    /// event's samples: the leader itself when an extra event aliases it,
+    /// plus the sibling events. The per-sample values arrive via
+    /// `SampleRecord::read`, matched by id.
+    pub fn extra_event_ids(&self) -> impl Iterator<Item = (u64, &str)> {
+        self.leader_alias
             .iter()
-            .map(|sibling| (sibling.id, sibling.name.as_str()))
+            .map(|(id, name)| (*id, name.as_str()))
+            .chain(
+                self.siblings
+                    .iter()
+                    .map(|sibling| (sibling.id, sibling.name.as_str())),
+            )
     }
 
     #[inline]
@@ -739,5 +799,40 @@ impl Iterator for EventIter<'_> {
             position: perf.position,
             parse_info: self.perf.parse_info,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_event_specs_parse() {
+        let event: ExtraEvent = "instructions:0:0x1".parse().unwrap();
+        assert_eq!(event.event_type, PERF_TYPE_HARDWARE);
+        assert_eq!(event.config, 1);
+        assert_eq!(event.name, "instructions");
+
+        let event: ExtraEvent = "mem_load_retired.l1_miss:4:0x08d1".parse().unwrap();
+        assert_eq!(event.event_type, 4);
+        assert_eq!(event.config, 0x08d1);
+        assert_eq!(event.name, "mem_load_retired.l1_miss");
+
+        let event: ExtraEvent = "l1d_cache:4:4".parse().unwrap();
+        assert_eq!((event.event_type, event.config), (4, 4));
+    }
+
+    #[test]
+    fn malformed_specs_are_rejected() {
+        for spec in [
+            "",
+            "name-only",
+            "name:0",
+            ":0:0x1",
+            "name:nope:0x1",
+            "name:0:nope",
+        ] {
+            assert!(spec.parse::<ExtraEvent>().is_err(), "{spec:?} should fail");
+        }
     }
 }
