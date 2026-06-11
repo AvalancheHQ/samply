@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::ops::Deref;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -561,10 +563,18 @@ fn init_profiler(
     }
 
     // eprintln!("Enabling perf events...");
-    match attach_mode {
-        AttachMode::StopAttachEnableResume => perf.enable(),
-        AttachMode::AttachWithEnableOnExec => {
-            // The perf event will get enabled automatically once the forked child process execs.
+    if perf.is_system_wide() {
+        // System-wide per-CPU events aren't tied to the launched task, so
+        // ENABLE_ON_EXEC never fires for them. Enable now; the launched
+        // process is still suspended, and any activity before it execs belongs
+        // to other processes and is dropped by the pid-tree filter.
+        perf.enable();
+    } else {
+        match attach_mode {
+            AttachMode::StopAttachEnableResume => perf.enable(),
+            AttachMode::AttachWithEnableOnExec => {
+                // The perf event will get enabled automatically once the forked child process execs.
+            }
         }
     }
 
@@ -595,10 +605,45 @@ fn run_profiler(
     let mut pending_lost_events = 0;
     let mut total_lost_events = 0;
     let mut last_timestamp = 0;
+
+    // In the system-wide fallback, the ring buffers carry every process on the
+    // machine. Keep only the launched process trees: seed with the pids we were
+    // asked to profile and grow the set as their children fork. In the normal
+    // per-task mode the kernel already scopes the events, so this stays off.
+    let system_wide = perf.is_system_wide();
+    let profiled_pids: Rc<RefCell<HashSet<u32>>> =
+        Rc::new(RefCell::new(perf.root_pids().iter().copied().collect()));
+
     let mut handle_event = |event_ref: EventRef| {
         let record = event_ref.get();
         let parsed_record = record.parse().unwrap();
         // debug!("Recording parsed_record: {:#?}", parsed_record);
+
+        if system_wide {
+            match &parsed_record {
+                // A fork extends the tree: if the parent is one we track, adopt
+                // the child (covers both new threads, where pid == ppid, and
+                // new child processes). Drop forks outside our trees.
+                EventRecord::Fork(e) => {
+                    let parent_tracked = profiled_pids.borrow().contains(&(e.ppid as u32));
+                    if parent_tracked {
+                        profiled_pids.borrow_mut().insert(e.pid as u32);
+                    }
+                    if !profiled_pids.borrow().contains(&(e.pid as u32)) {
+                        return;
+                    }
+                }
+                // Every other record carries a pid (PERF_SAMPLE_ID_ALL); skip
+                // it unless it belongs to a tracked process tree.
+                _ => {
+                    if let Some(pid) = record.common_data().ok().and_then(|c| c.pid) {
+                        if !profiled_pids.borrow().contains(&(pid as u32)) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
 
         if let Some(timestamp) = record.timestamp() {
             if timestamp < last_timestamp {
@@ -687,6 +732,9 @@ fn run_profiler(
             Ok(SamplerRequest::StartProfilingAnotherProcess(another_pid, attach_mode)) => {
                 match perf.open_process(another_pid, attach_mode) {
                     Ok(_) => {
+                        // Track this new root so its samples survive the
+                        // system-wide pid filter (no-op in per-task mode).
+                        profiled_pids.borrow_mut().insert(another_pid);
                         more_processes_reply_sender.send(true).unwrap();
                     }
                     Err(error) => {
@@ -725,7 +773,11 @@ fn run_profiler(
             }
         }
 
-        if perf.is_empty() && should_stop_profiling_once_perf_events_exhausted {
+        // Per-task events close when their process exits, so we wait for them
+        // to drain. System-wide per-CPU events never close on their own (they
+        // outlive the launched process), so once the launched process has
+        // exited there is nothing left to wait for — stop right away.
+        if should_stop_profiling_once_perf_events_exhausted && (perf.is_empty() || system_wide) {
             break;
         }
 

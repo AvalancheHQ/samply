@@ -309,6 +309,11 @@ fn read_event_id(fd: RawFd) -> io::Result<u64> {
 #[derive(Clone, Debug)]
 pub struct PerfBuilder {
     pid: u32,
+    /// Open the event system-wide (`pid = -1`), capturing every thread
+    /// scheduled on the selected CPU instead of a single task tree. Used as a
+    /// fallback when the kernel can't combine `inherit` with
+    /// `PERF_SAMPLE_READ` (see [`Perf::supports_inherited_sample_read`]).
+    all_processes: bool,
     cpu: Option<u32>,
     frequency: u64,
     stack_size: u32,
@@ -325,6 +330,14 @@ pub struct PerfBuilder {
 impl PerfBuilder {
     pub fn pid(mut self, pid: u32) -> Self {
         self.pid = pid;
+        self
+    }
+
+    /// Open the event system-wide (`pid = -1`) rather than scoped to a single
+    /// pid. Must be paired with [`Self::only_cpu`] (a system-wide event needs a
+    /// CPU) and is mutually exclusive with [`Self::inherit_to_children`].
+    pub fn all_pids(mut self) -> Self {
+        self.all_processes = true;
         self
     }
 
@@ -391,7 +404,9 @@ impl PerfBuilder {
     }
 
     pub fn open(self) -> io::Result<Perf> {
-        let pid = self.pid;
+        // `-1` means "all processes" (system-wide), which the kernel only
+        // accepts together with a specific CPU.
+        let pid: i32 = if self.all_processes { -1 } else { self.pid as i32 };
         let cpu = self.cpu.map(|cpu| cpu as i32).unwrap_or(-1);
         let frequency = self.frequency;
         let stack_size = self.stack_size;
@@ -617,6 +632,37 @@ impl PerfBuilder {
 }
 
 impl Perf {
+    /// Whether this kernel allows opening a sampling event with both `inherit`
+    /// and `PERF_SAMPLE_READ` set. Linux rejected that combination with
+    /// `EINVAL` until 6.12; on such kernels the extra-event group must instead
+    /// be opened system-wide and without `inherit`.
+    ///
+    /// Probes by opening a throwaway event that mirrors the real leader's
+    /// attributes (sampling, grouped read, inherit) on this process and CPU 0;
+    /// `inherit` can't be paired with `cpu == -1`, so a concrete CPU is used.
+    pub fn supports_inherited_sample_read() -> bool {
+        let mut attr: PerfEventAttr = unsafe { mem::zeroed() };
+        attr.size = mem::size_of::<PerfEventAttr>() as u32;
+        attr.kind = PERF_TYPE_HARDWARE;
+        attr.config = PERF_COUNT_HW_CPU_CYCLES;
+        attr.sample_type =
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_READ;
+        attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID;
+        attr.sample_period_or_freq = 1_000_000;
+        attr.clock_id = libc::CLOCK_MONOTONIC;
+        attr.flags =
+            PERF_ATTR_FLAG_DISABLED | PERF_ATTR_FLAG_INHERIT | PERF_ATTR_FLAG_USE_CLOCKID;
+
+        let fd = sys_perf_event_open(&attr, 0, 0, -1, PERF_FLAG_FD_CLOEXEC);
+        if fd == -1 {
+            return false;
+        }
+        unsafe {
+            libc::close(fd);
+        }
+        true
+    }
+
     pub fn max_sample_rate() -> Option<u64> {
         let data = std::fs::read_to_string("/proc/sys/kernel/perf_event_max_sample_rate").ok()?;
         data.trim().parse::<u64>().ok()
@@ -625,6 +671,7 @@ impl Perf {
     pub fn build() -> PerfBuilder {
         PerfBuilder {
             pid: 0,
+            all_processes: false,
             cpu: None,
             frequency: 0,
             stack_size: 0,

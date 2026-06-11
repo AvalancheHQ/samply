@@ -82,6 +82,13 @@ pub struct PerfGroup {
     event_source: EventSource,
     extra_events: Vec<ExtraEvent>,
     stopped_processes: Vec<StoppedProcess>,
+    /// When true, the extra-event group can't be opened with `inherit` on this
+    /// kernel (pre-6.12), so events are opened per-CPU system-wide (no inherit)
+    /// and samples must be filtered to [`Self::root_pids`] downstream.
+    system_wide: bool,
+    /// The pids `open_process` was asked to profile; the roots of the process
+    /// trees whose samples we keep when running system-wide.
+    root_pids: Vec<u32>,
 }
 
 fn get_threads(pid: u32) -> Result<Vec<u32>, io::Error> {
@@ -114,6 +121,17 @@ impl PerfGroup {
         event_source: EventSource,
         extra_events: Vec<ExtraEvent>,
     ) -> Self {
+        // Extra events ride along on each sample via PERF_SAMPLE_READ. On
+        // kernels that reject `inherit` + PERF_SAMPLE_READ (pre-6.12), fall
+        // back to per-CPU system-wide capture, which follows every thread on
+        // the CPU without `inherit`.
+        let system_wide = !extra_events.is_empty() && !Perf::supports_inherited_sample_read();
+        if system_wide {
+            eprintln!(
+                "Note: this kernel can't attach the extra perf events to inherited samples; \
+                 capturing them per-CPU system-wide and filtering to the launched process tree."
+            );
+        }
         PerfGroup {
             event_sorter: EventSorter::new(),
             members: Default::default(),
@@ -125,7 +143,20 @@ impl PerfGroup {
             extra_events,
             regs_mask,
             stopped_processes: Vec::new(),
+            system_wide,
+            root_pids: Vec::new(),
         }
+    }
+
+    /// Whether events are opened per-CPU system-wide (the pre-6.12 fallback);
+    /// callers must then filter samples to [`Self::root_pids`].
+    pub fn is_system_wide(&self) -> bool {
+        self.system_wide
+    }
+
+    /// The pids whose process trees this group is profiling.
+    pub fn root_pids(&self) -> &[u32] {
+        &self.root_pids
     }
 
     pub fn open(
@@ -147,6 +178,8 @@ impl PerfGroup {
         if attach_mode == AttachMode::StopAttachEnableResume {
             self.stopped_processes.push(StoppedProcess::new(pid)?);
         }
+        self.root_pids.push(pid);
+        let system_wide = self.system_wide;
         let mut perf_events = Vec::new();
         let threads = get_threads(pid)?;
 
@@ -162,11 +195,22 @@ impl PerfGroup {
                 .extra_events(self.extra_events.clone())
                 .start_disabled();
             if let Some(cpu) = cpu {
-                builder = builder.only_cpu(cpu).inherit_to_children();
+                builder = builder.only_cpu(cpu);
+                if system_wide {
+                    // System-wide on this CPU: captures every thread scheduled
+                    // here (including ones spawned later) without `inherit`,
+                    // which is what makes PERF_SAMPLE_READ legal pre-6.12.
+                    builder = builder.all_pids();
+                } else {
+                    builder = builder.inherit_to_children();
+                }
             } else {
                 builder = builder.any_cpu();
             }
-            if attach_mode == AttachMode::AttachWithEnableOnExec {
+            // ENABLE_ON_EXEC only fires for events attached to the task that
+            // execs. System-wide events aren't, so they're enabled explicitly
+            // by the caller instead (see `init_profiler`).
+            if attach_mode == AttachMode::AttachWithEnableOnExec && !system_wide {
                 builder = builder.enable_on_exec();
             }
             builder.open()
@@ -178,16 +222,22 @@ impl PerfGroup {
             perf_events.push((Some(cpu), perf));
         }
 
-        if cpu_count * (threads.len() + 1) >= 1000 {
-            for &tid in &threads {
-                let perf = open_perf(tid, None)?;
-                perf_events.push((None, perf));
-            }
-        } else {
-            for cpu in 0..cpu_count as u32 {
+        // System-wide per-CPU events already cover every thread on every CPU,
+        // so the per-thread enrollment below (which exists to attach to the
+        // already-running threads of the target pid) is only needed in the
+        // per-task + inherit mode.
+        if !system_wide {
+            if cpu_count * (threads.len() + 1) >= 1000 {
                 for &tid in &threads {
-                    let perf = open_perf(tid, Some(cpu))?;
-                    perf_events.push((Some(cpu), perf));
+                    let perf = open_perf(tid, None)?;
+                    perf_events.push((None, perf));
+                }
+            } else {
+                for cpu in 0..cpu_count as u32 {
+                    for &tid in &threads {
+                        let perf = open_perf(tid, Some(cpu))?;
+                        perf_events.push((Some(cpu), perf));
+                    }
                 }
             }
         }
