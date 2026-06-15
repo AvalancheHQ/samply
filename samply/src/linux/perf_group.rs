@@ -91,6 +91,38 @@ pub struct PerfGroup {
     root_pids: Vec<u32>,
 }
 
+/// Every online CPU on the machine, parsed from `/sys/devices/system/cpu/online`
+/// (a comma-separated list of ids and ranges, e.g. `"0-3,5,8-11"`).
+///
+/// `num_cpus::get()` would be wrong here: it counts only the CPUs in the
+/// caller's cpuset, but we need the CPUs the *profiled* process can run on, and
+/// that process may be confined to a disjoint cpuset we can't observe from here.
+/// Falls back to `0..num_cpus::get()` if sysfs is unreadable.
+fn online_cpus() -> Vec<u32> {
+    fn parse(list: &str) -> Option<Vec<u32>> {
+        let mut cpus = Vec::new();
+        for part in list.trim().split(',') {
+            if part.is_empty() {
+                continue;
+            }
+            match part.split_once('-') {
+                Some((start, end)) => {
+                    let start: u32 = start.trim().parse().ok()?;
+                    let end: u32 = end.trim().parse().ok()?;
+                    cpus.extend(start..=end);
+                }
+                None => cpus.push(part.trim().parse().ok()?),
+            }
+        }
+        (!cpus.is_empty()).then_some(cpus)
+    }
+
+    fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|s| parse(&s))
+        .unwrap_or_else(|| (0..num_cpus::get() as u32).collect())
+}
+
 fn get_threads(pid: u32) -> Result<Vec<u32>, io::Error> {
     let entries = fs::read_dir(format!("/proc/{pid}/task"))?;
     let tids = entries
@@ -216,8 +248,15 @@ impl PerfGroup {
             builder.open()
         };
 
-        let cpu_count = num_cpus::get();
-        for cpu in 0..cpu_count as u32 {
+        // A per-CPU event only ever sees the CPU it was opened on, so we must
+        // open one for every CPU the target might be scheduled on. The target's
+        // cpuset can be disjoint from ours and unknowable at this point: e.g.
+        // under CodSpeed the target is launched into a separate cgroup slice via
+        // `systemd-run`, so by the time it exists and is pinned we've long since
+        // opened these events. Covering all online CPUs sidesteps that entirely.
+        let cpu_ids = online_cpus();
+        let cpu_count = cpu_ids.len();
+        for &cpu in &cpu_ids {
             let perf = open_perf(pid, Some(cpu))?;
             perf_events.push((Some(cpu), perf));
         }
@@ -233,7 +272,7 @@ impl PerfGroup {
                     perf_events.push((None, perf));
                 }
             } else {
-                for cpu in 0..cpu_count as u32 {
+                for &cpu in &cpu_ids {
                     for &tid in &threads {
                         let perf = open_perf(tid, Some(cpu))?;
                         perf_events.push((Some(cpu), perf));
