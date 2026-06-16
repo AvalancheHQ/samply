@@ -221,7 +221,6 @@ impl PerfGroup {
                 .frequency(self.frequency as u64)
                 .sample_user_stack(self.stack_size)
                 .sample_user_regs(self.regs_mask)
-                .sample_kernel()
                 .gather_context_switches()
                 .event_source(self.event_source)
                 .extra_events(self.extra_events.clone())
