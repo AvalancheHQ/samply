@@ -261,7 +261,14 @@ impl ExtraEvent {
         // enable_on_exec state gates the whole group. (Opening siblings
         // disabled would be wrong: PERF_EVENT_IOC_ENABLE on the leader only
         // enables the leader, and would leave the siblings off forever.)
-        attr.flags = leader_attr.flags & (PERF_ATTR_FLAG_EXCLUDE_KERNEL | PERF_ATTR_FLAG_INHERIT);
+        //
+        // USE_CLOCKID is copied alongside clock_id above: the kernel requires
+        // every event in a group to use the same clock, and rejects a sibling
+        // that carries the leader's clock_id without also setting the flag.
+        attr.flags = leader_attr.flags
+            & (PERF_ATTR_FLAG_EXCLUDE_KERNEL
+                | PERF_ATTR_FLAG_INHERIT
+                | PERF_ATTR_FLAG_USE_CLOCKID);
         attr
     }
 }
