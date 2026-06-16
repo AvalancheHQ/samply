@@ -15,7 +15,7 @@ doctest = false
 [dependencies]
 
 fxprof-processed-profile = { version = "0.8", path = "../fxprof-processed-profile" }
-framehop = { git = "https://github.com/CodSpeedHQ/framehop", rev = "bdf2813a2c5149fd66b9b4685035e70124bd672a" }
+framehop = { git = "https://github.com/CodSpeedHQ/framehop", rev = "5852f775c2ffa55a24da469b0b73457ac3bc3fa6" }
 # linux-perf-data = { path = "../../linux-perf-data", default-features = false }
 linux-perf-data = { git = "https://github.com/CodSpeedHQ/linux-perf-data", rev = "5762e6e967bf" }
 

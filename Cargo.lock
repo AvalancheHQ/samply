@@ -746,7 +746,7 @@ dependencies = [
 [[package]]
 name = "framehop"
 version = "0.16.0"
-source = "git+https://github.com/CodSpeedHQ/framehop?rev=bdf2813a2c5149fd66b9b4685035e70124bd672a#bdf2813a2c5149fd66b9b4685035e70124bd672a"
+source = "git+https://github.com/CodSpeedHQ/framehop?rev=5852f775c2ffa55a24da469b0b73457ac3bc3fa6#5852f775c2ffa55a24da469b0b73457ac3bc3fa6"
 dependencies = [
  "arrayvec",
  "cfg-if",

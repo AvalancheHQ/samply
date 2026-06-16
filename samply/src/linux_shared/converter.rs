@@ -780,27 +780,66 @@ where
             }
         }
 
-        // If DWARF unwinding was truncated, fall back to the user portion of
-        // the kernel's FP callchain for the remaining (deeper) frames.
-        if dwarf_truncated && fp_user_frames.len() > 1 {
-            let last_dwarf_addr = stack.last().map(|f| f.address());
-            let splice_idx = last_dwarf_addr
-                .and_then(|addr| fp_user_frames.iter().position(|f| f.address() == addr))
-                .map(|i| i + 1)
-                .unwrap_or(fp_user_frames.len());
-            if splice_idx < fp_user_frames.len() {
-                stack.extend_from_slice(&fp_user_frames[splice_idx..]);
+        // Frame-pointer unwinding (framehop's fallback for code without
+        // `.eh_frame`, and the kernel's FP callchain) can mistake a stack-local
+        // value for a saved return address. A genuine code address always lies
+        // in a known module, so trim trailing user frames from the root inward
+        // until one does (or we hit a non-user frame).
+        let trim_unmapped_root = |stack: &mut Vec<StackFrame>| {
+            while let Some(last) = stack.last() {
+                if last.stack_mode() != Some(StackMode::User) {
+                    break;
+                }
+                let addr = last.address();
+                if addr != 0 && !unwinder.is_address_in_module(addr) {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+        };
+
+        // Reconcile the DWARF stack against the user portion of the kernel's FP
+        // callchain. The two can disagree because DWARF unwinding falls back to
+        // the frame pointer wherever a module lacks `.eh_frame`, and that walk
+        // runs over the limited captured stack window: it can truncate, stop at
+        // a spurious `fp == 0`, or emit a bogus frame before bailing. The kernel
+        // walked live memory at sample time and is often more complete.
+        //
+        // Compare from the leaf to find the agreeing prefix, then take whichever
+        // stack reaches deeper. If DWARF is a prefix of the callchain, append the
+        // frames it didn't reach. If their tails diverge, keep DWARF unless the
+        // callchain is strictly longer — a longer callchain means the FP walk saw
+        // further than DWARF's windowed unwind (DWARF fell back to frame pointers
+        // and drifted), while a shorter one means the kernel's FP walk is the one
+        // that failed (frame-pointer-omitting code that DWARF unwinds correctly
+        // via real CFI). Completeness is the signal, not whether the module has
+        // unwind info: a module can carry `.eh_frame` for only part of itself.
+        if fp_user_frames.len() > 1 {
+            let dwarf_len = stack.len() - dwarf_start;
+            let common = stack[dwarf_start..]
+                .iter()
+                .zip(fp_user_frames.iter())
+                .take_while(|(a, b)| a.address() == b.address())
+                .count();
+            if common == dwarf_len {
+                stack.extend_from_slice(&fp_user_frames[common..]);
+            } else if fp_user_frames.len() > dwarf_len && common >= 1 {
+                stack.truncate(dwarf_start + common);
+                stack.extend_from_slice(&fp_user_frames[common..]);
             }
         } else if dwarf_truncated || stack.len() == dwarf_start {
-            // No DWARF frames at all, or truncated with no FP fallback available.
-            // Use the FP user frames directly if we have them, otherwise just the
-            // callchain frames were already added above.
+            // No usable callchain. Use what little we have, or mark truncation.
             if stack.len() == dwarf_start && !fp_user_frames.is_empty() {
                 stack.extend_from_slice(fp_user_frames);
             } else if dwarf_truncated {
                 stack.push(StackFrame::TruncatedStackMarker);
             }
         }
+
+        // The callchain frames appended above weren't run through DWARF, so an FP
+        // root can still slip in; trim trailing frames outside any known module.
+        trim_unmapped_root(&mut *stack);
 
         if stack.is_empty() {
             if let Some(ip) = e.ip {
