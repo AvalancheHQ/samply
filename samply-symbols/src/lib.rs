@@ -239,6 +239,7 @@ mod source_file_path;
 mod symbol_map;
 mod symbol_map_object;
 mod symbol_map_string_interner;
+mod v8_inline;
 mod windows;
 
 pub use crate::binary_image::{BinaryImage, CodeByteReadingError};

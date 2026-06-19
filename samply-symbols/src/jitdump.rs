@@ -20,8 +20,20 @@ use crate::shared::{
     LookupAddress, SymbolInfo,
 };
 use crate::symbol_map::{GetInnerSymbolMap, SymbolMap, SymbolMapTrait};
+use crate::v8_inline::V8InlineMap;
 use crate::{FileAndPathHelper, SourceFilePath, SourceFilePathHandle, SyncAddressInfo};
 use crate::{FunctionNameHandle, SymbolMapStringInterner, SymbolNameHandle};
+
+/// Resolve the V8 code log for the process that produced a jitdump.
+///
+/// `CODSPEED_V8_LOG` names a directory holding one `codspeed-v8-<pid>.log` per
+/// profiled process. Joining the jitdump's own pid picks the matching log, so a
+/// multi-process capture keeps each process's inline data separate. Returns
+/// `None` when the env var is unset.
+fn v8_log_path_for_pid(pid: u32) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("CODSPEED_V8_LOG")?;
+    Some(std::path::Path::new(&dir).join(format!("codspeed-v8-{pid}.log")))
+}
 
 pub fn is_jitdump_file<T: FileContents>(file_contents: &FileContentsWrapper<T>) -> bool {
     const MAGIC_BYTES_BE: &[u8] = b"JiTD";
@@ -189,19 +201,30 @@ impl<T: FileContents> GetInnerSymbolMap for JitDumpSymbolMap<T> {
 pub struct JitDumpSymbolMapOuter<T: FileContents> {
     data: FileContentsWrapper<T>,
     index: JitDumpIndex,
+    /// Inline map from the V8 code log of the process that produced this
+    /// jitdump, used to expand TurboFan/Maglev inlined frames that the jitdump
+    /// itself collapses. `None` when no log was found.
+    v8_inline: Option<V8InlineMap>,
 }
 
 impl<T: FileContents> JitDumpSymbolMapOuter<T> {
     pub fn new(data: FileContentsWrapper<T>) -> Result<Self, Error> {
         let cursor = FileContentsCursor::new(&data);
         let reader = JitDumpReader::new(cursor)?;
+        let pid = reader.header().pid;
         let index = JitDumpIndex::from_reader(reader).map_err(Error::JitDumpFileReading)?;
-        Ok(Self { data, index })
+        let v8_inline = v8_log_path_for_pid(pid).and_then(|p| V8InlineMap::from_log_file(&p));
+        Ok(Self {
+            data,
+            index,
+            v8_inline,
+        })
     }
 
     pub fn make_symbol_map(&self) -> JitDumpSymbolMapInnerWrapper<'_> {
         let inner = JitDumpSymbolMapInner {
             index: &self.index,
+            v8_inline: self.v8_inline.as_ref(),
             cache: Mutex::new(JitDumpSymbolMapCache::new(
                 &self.data,
                 &self.index,
@@ -214,6 +237,7 @@ impl<T: FileContents> JitDumpSymbolMapOuter<T> {
 
 struct JitDumpSymbolMapInner<'a, T: FileContents> {
     index: &'a JitDumpIndex,
+    v8_inline: Option<&'a V8InlineMap>,
     cache: Mutex<JitDumpSymbolMapCache<'a, T>>,
 }
 
@@ -296,6 +320,39 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
             size: Some(self.index.entries[index].code_bytes_len as u32),
             name: name.into(),
         };
+
+        // The jitdump records only the innermost inlined source line per PC, so
+        // a TurboFan/Maglev-inlined chain collapses to a single frame.
+        // Recover the missing callers from the V8 log, joining on (address, size)
+        // since V8 reuses freed code addresses over the run. These frames sit
+        // above the code object's own jitdump frame, which is appended last so a
+        // PC with no inlining resolves to just that single frame.
+        let inlined_frames: Vec<FrameDebugInfo> = if let Some(v8) = self.v8_inline {
+            let code_size = self.index.entries[index].code_bytes_len as u32;
+            let code_addr = cache.get_debug_info(index).map(|di| di.code_addr);
+            code_addr
+                .and_then(|addr| v8.lookup(addr, code_size, offset_relative_to_symbol))
+                .map(|frames| {
+                    frames
+                        .iter()
+                        .map(|f| {
+                            let function = cache.string_interner.intern_owned(&f.name);
+                            let file_path = cache.string_interner.intern_owned(&f.file);
+                            FrameDebugInfo {
+                                function: Some(function.into()),
+                                file_path: Some(file_path.into()),
+                                line_number: Some(f.line),
+                                column_number: Some(f.col),
+                                ..Default::default()
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let Some(debug_info) = cache.get_debug_info(index) else {
             return Some(SyncAddressInfo {
                 symbol,
@@ -312,7 +369,7 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
                 .string_interner
                 .intern_owned(&String::from_utf8_lossy(&s)),
         };
-        let frame = FrameDebugInfo {
+        let outer_frame = FrameDebugInfo {
             function: Some(name.into()),
             file_path: Some(file_path.into()),
             line_number: Some(line),
@@ -320,7 +377,10 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
             ..Default::default()
         };
 
-        let frames = Some(FramesLookupResult::Available(vec![frame]));
+        // Innermost inlined frame first, the code object's own frame last.
+        let mut frames = inlined_frames;
+        frames.push(outer_frame);
+        let frames = Some(FramesLookupResult::Available(frames));
         Some(SyncAddressInfo { symbol, frames })
     }
 }
