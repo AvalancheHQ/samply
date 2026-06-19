@@ -230,7 +230,10 @@ impl std::str::FromStr for ExtraEvent {
 }
 
 fn parse_u64(value: &str) -> Option<u64> {
-    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => value.parse().ok(),
     }
@@ -266,9 +269,7 @@ impl ExtraEvent {
         // every event in a group to use the same clock, and rejects a sibling
         // that carries the leader's clock_id without also setting the flag.
         attr.flags = leader_attr.flags
-            & (PERF_ATTR_FLAG_EXCLUDE_KERNEL
-                | PERF_ATTR_FLAG_INHERIT
-                | PERF_ATTR_FLAG_USE_CLOCKID);
+            & (PERF_ATTR_FLAG_EXCLUDE_KERNEL | PERF_ATTR_FLAG_INHERIT | PERF_ATTR_FLAG_USE_CLOCKID);
         attr
     }
 }
@@ -374,6 +375,9 @@ impl PerfBuilder {
     }
 
     /// Turns on the kernel measurements. This requires the `/proc/sys/kernel/perf_event_paranoid` to be less than `2`.
+    /// CodSpeed does not sample kernel so this function is now unused but kept since at some point
+    /// kernel will be sampled.
+    #[allow(dead_code)]
     pub fn sample_kernel(mut self) -> Self {
         self.exclude_kernel = false;
         self
@@ -413,7 +417,11 @@ impl PerfBuilder {
     pub fn open(self) -> io::Result<Perf> {
         // `-1` means "all processes" (system-wide), which the kernel only
         // accepts together with a specific CPU.
-        let pid: i32 = if self.all_processes { -1 } else { self.pid as i32 };
+        let pid: i32 = if self.all_processes {
+            -1
+        } else {
+            self.pid as i32
+        };
         let cpu = self.cpu.map(|cpu| cpu as i32).unwrap_or(-1);
         let frequency = self.frequency;
         let stack_size = self.stack_size;
@@ -660,13 +668,11 @@ impl Perf {
         attr.size = mem::size_of::<PerfEventAttr>() as u32;
         attr.kind = PERF_TYPE_HARDWARE;
         attr.config = PERF_COUNT_HW_CPU_CYCLES;
-        attr.sample_type =
-            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_READ;
+        attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_READ;
         attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID;
         attr.sample_period_or_freq = 1_000_000;
         attr.clock_id = libc::CLOCK_MONOTONIC;
-        attr.flags =
-            PERF_ATTR_FLAG_DISABLED | PERF_ATTR_FLAG_INHERIT | PERF_ATTR_FLAG_USE_CLOCKID;
+        attr.flags = PERF_ATTR_FLAG_DISABLED | PERF_ATTR_FLAG_INHERIT | PERF_ATTR_FLAG_USE_CLOCKID;
 
         let fd = sys_perf_event_open(&attr, 0, 0, -1, PERF_FLAG_FD_CLOEXEC);
         if fd == -1 {
