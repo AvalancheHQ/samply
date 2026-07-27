@@ -157,7 +157,20 @@ pub fn do_record_action(record_args: cli::RecordArgs) {
         );
     }
 
-    std::process::exit(exit_status.code().unwrap_or(0));
+    // A process killed by a signal has no exit code; report it as 128 + signal,
+    // following the shell convention.
+    let exit_code = exit_status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            exit_status.signal().map_or(1, |signal| 128 + signal)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    });
+    std::process::exit(exit_code);
 }
 
 pub fn convert_file_to_profile(

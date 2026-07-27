@@ -177,10 +177,8 @@ pub fn run(
     let mut wait_status = process.wait().unwrap();
 
     for i in 2..=iteration_count {
-        let previous_run_exited_with_success = match &wait_status {
-            WaitStatus::Exited(_pid, exit_code) => ExitStatus::from_raw(*exit_code).success(),
-            _ => false,
-        };
+        let previous_run_exited_with_success =
+            exit_status_from_wait_status(&wait_status).success();
         if !ignore_exit_code && !previous_run_exited_with_success {
             eprintln!(
                 "Skipping remaining iterations due to non-success exit status: {wait_status:?}"
@@ -236,12 +234,23 @@ pub fn run(
         .join()
         .expect("couldn't join observer thread");
 
-    let exit_status = match wait_status {
-        WaitStatus::Exited(_pid, exit_code) => ExitStatus::from_raw(exit_code),
-        _ => ExitStatus::default(),
-    };
+    Ok((profile, exit_status_from_wait_status(&wait_status)))
+}
 
-    Ok((profile, exit_status))
+/// Rebuilds an [`ExitStatus`] from an already-decoded [`WaitStatus`].
+///
+/// [`ExitStatus::from_raw`] takes the raw value `waitpid` reports, in which the
+/// exit code lives in bits 8-15 and the low byte encodes the terminating
+/// signal. `nix` has already split those apart, so the parts have to be shifted
+/// back into place.
+fn exit_status_from_wait_status(wait_status: &WaitStatus) -> ExitStatus {
+    match wait_status {
+        WaitStatus::Exited(_pid, exit_code) => ExitStatus::from_raw(exit_code << 8),
+        WaitStatus::Signaled(_pid, signal, core_dumped) => {
+            ExitStatus::from_raw(*signal as i32 | if *core_dumped { 0x80 } else { 0 })
+        }
+        _ => ExitStatus::default(),
+    }
 }
 
 fn start_profiling_pid(
