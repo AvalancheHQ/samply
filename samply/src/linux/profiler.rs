@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::ops::Deref;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -177,8 +177,7 @@ pub fn run(
     let mut wait_status = process.wait().unwrap();
 
     for i in 2..=iteration_count {
-        let previous_run_exited_with_success =
-            exit_status_from_wait_status(&wait_status).success();
+        let previous_run_exited_with_success = exit_status_from_wait_status(&wait_status).success();
         if !ignore_exit_code && !previous_run_exited_with_success {
             eprintln!(
                 "Skipping remaining iterations due to non-success exit status: {wait_status:?}"
