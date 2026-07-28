@@ -182,6 +182,12 @@ pub struct Downloader {
     reqwest_client: Result<ClientWithMiddleware, reqwest::Error>,
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
+const MIN_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_MAX_RETRIES: u32 = 1;
+
 impl Default for Downloader {
     fn default() -> Self {
         Downloader::new()
@@ -204,13 +210,13 @@ fn ensure_crypto_provider_installed() {
 
 impl Downloader {
     pub fn new() -> Self {
-        Self::new_internal(5, None)
+        Self::new_internal(DEFAULT_MAX_RETRIES, None)
     }
 
     /// Create a `Downloader` with the given `User-Agent` header string and the default
-    /// retry policy (5 retries with exponential backoff).
+    /// retry policy (exponential backoff, [`DEFAULT_MAX_RETRIES`] retries).
     pub fn new_with_user_agent(user_agent: &str) -> Self {
-        Self::new_internal(5, Some(user_agent))
+        Self::new_internal(DEFAULT_MAX_RETRIES, Some(user_agent))
     }
 
     /// Create a `Downloader` that retries transient failures (5xx, 429, connection
@@ -240,9 +246,19 @@ impl Downloader {
             None => builder,
         };
 
-        // TODO: Add timeouts
+        // An unreachable or broken symbol server must not hold up the caller. There is
+        // no total request timeout: debuginfo payloads are large and legitimately slow,
+        // so only connection setup and stalled reads are bounded.
+        let builder = builder
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT);
+
         let reqwest_client = builder.build().map(|client| {
-            let retry_policy = ExponentialBackoff::builder().build_with_max_retries(max_retries);
+            // The default bounds (1s to 30min, base 3, full jitter) let five retries
+            // against a server that is down sleep for up to two minutes.
+            let retry_policy = ExponentialBackoff::builder()
+                .retry_bounds(MIN_RETRY_INTERVAL, MAX_RETRY_INTERVAL)
+                .build_with_max_retries(max_retries);
             reqwest_middleware::ClientBuilder::new(client)
                 .with(RetryTransientMiddleware::new_with_policy(retry_policy))
                 .build()
