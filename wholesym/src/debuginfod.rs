@@ -11,6 +11,23 @@ enum DebuginfodDownloaderInner {
     Manual(ManualDebuginfodDownloader),
 }
 
+/// Servers that never answer, so every lookup ends up costing a connection
+/// timeout. `DEBUGINFOD_URLS` is preset to the Ubuntu one on Ubuntu and its
+/// derivatives, so it shows up on machines that never opted into debuginfod.
+///
+/// See <https://github.com/canonical/ubuntu.com/issues/16365>.
+const DENIED_SERVERS: [&str; 1] = ["debuginfod.ubuntu.com"];
+
+fn is_denied_server(url: &str) -> bool {
+    let host = url
+        .split_once("://")
+        .map_or(url, |(_scheme, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default();
+    DENIED_SERVERS.contains(&host)
+}
+
 impl DebuginfodDownloader {
     pub fn new(
         debuginfod_cache_dir_if_not_installed: Option<PathBuf>,
@@ -27,6 +44,9 @@ impl DebuginfodDownloader {
             ) {
                 let mut servers_from_env = Vec::new();
                 for url in urls.split_ascii_whitespace() {
+                    if is_denied_server(url) {
+                        continue;
+                    }
                     servers_from_env.push((url.to_string(), cache_dir.clone()));
                 }
                 let extra_servers = std::mem::replace(&mut servers_and_caches, servers_from_env);
