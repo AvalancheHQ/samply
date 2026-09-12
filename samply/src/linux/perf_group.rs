@@ -91,6 +91,25 @@ pub struct PerfGroup {
     root_pids: Vec<u32>,
 }
 
+/// Parse a Linux cpulist (e.g. `"0-3,5,8-11"`) into individual CPU ids.
+fn parse_cpu_list(list: &str) -> Option<Vec<u32>> {
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let start: u32 = start.trim().parse().ok()?;
+                let end: u32 = end.trim().parse().ok()?;
+                cpus.extend(start..=end);
+            }
+            None => cpus.push(part.trim().parse().ok()?),
+        }
+    }
+    (!cpus.is_empty()).then_some(cpus)
+}
+
 /// Every online CPU on the machine, parsed from `/sys/devices/system/cpu/online`
 /// (a comma-separated list of ids and ranges, e.g. `"0-3,5,8-11"`).
 ///
@@ -99,28 +118,35 @@ pub struct PerfGroup {
 /// that process may be confined to a disjoint cpuset we can't observe from here.
 /// Falls back to `0..num_cpus::get()` if sysfs is unreadable.
 fn online_cpus() -> Vec<u32> {
-    fn parse(list: &str) -> Option<Vec<u32>> {
-        let mut cpus = Vec::new();
-        for part in list.trim().split(',') {
-            if part.is_empty() {
-                continue;
-            }
-            match part.split_once('-') {
-                Some((start, end)) => {
-                    let start: u32 = start.trim().parse().ok()?;
-                    let end: u32 = end.trim().parse().ok()?;
-                    cpus.extend(start..=end);
-                }
-                None => cpus.push(part.trim().parse().ok()?),
-            }
-        }
-        (!cpus.is_empty()).then_some(cpus)
-    }
-
     fs::read_to_string("/sys/devices/system/cpu/online")
         .ok()
-        .and_then(|s| parse(&s))
+        .and_then(|s| parse_cpu_list(&s))
         .unwrap_or_else(|| (0..num_cpus::get() as u32).collect())
+}
+
+/// CPUs to restrict system-wide events to, from `SAMPLY_CPUS` (a Linux cpulist
+/// like `"8-15"` or `"0,2,4-7"`). Only meaningful in system-wide mode: in
+/// per-task + inherit mode every online CPU must be covered regardless (see
+/// `open_process`).
+fn env_cpu_list() -> Result<Option<Vec<u32>>, io::Error> {
+    let spec = match std::env::var("SAMPLY_CPUS") {
+        Ok(spec) => spec,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SAMPLY_CPUS is not valid UTF-8",
+            ));
+        }
+    };
+    parse_cpu_list(&spec).map(Some).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid SAMPLY_CPUS value '{spec}': expected a cpulist like '8-15' or '0,2,4-7'"
+            ),
+        )
+    })
 }
 
 fn get_threads(pid: u32) -> Result<Vec<u32>, io::Error> {
@@ -156,9 +182,18 @@ impl PerfGroup {
         // Extra events ride along on each sample via PERF_SAMPLE_READ. On
         // kernels that reject `inherit` + PERF_SAMPLE_READ (pre-6.12), fall
         // back to per-CPU system-wide capture, which follows every thread on
-        // the CPU without `inherit`.
-        let system_wide = !extra_events.is_empty() && !Perf::supports_inherited_sample_read();
-        if system_wide {
+        // the CPU without `inherit`. SAMPLY_SYSTEM_WIDE=1 forces the same
+        // fallback unconditionally, e.g. to also drop `inherit` when there are
+        // no extra events.
+        let env_forced_system_wide = std::env::var("SAMPLY_SYSTEM_WIDE").as_deref() == Ok("1");
+        let system_wide = env_forced_system_wide
+            || (!extra_events.is_empty() && !Perf::supports_inherited_sample_read());
+        if env_forced_system_wide {
+            eprintln!(
+                "Note: SAMPLY_SYSTEM_WIDE=1 is set; capturing per-CPU system-wide and filtering \
+                 to the launched process tree."
+            );
+        } else if system_wide {
             eprintln!(
                 "Note: this kernel can't attach the extra perf events to inherited samples; \
                  capturing them per-CPU system-wide and filtering to the launched process tree."
@@ -253,7 +288,16 @@ impl PerfGroup {
         // under CodSpeed the target is launched into a separate cgroup slice via
         // `systemd-run`, so by the time it exists and is pinned we've long since
         // opened these events. Covering all online CPUs sidesteps that entirely.
-        let cpu_ids = online_cpus();
+        //
+        // In per-task + inherit mode, `inherit` still needs every online CPU
+        // covered (a thread can be scheduled anywhere), so SAMPLY_CPUS is
+        // honored only in system-wide mode, where the caller already knows
+        // (and is confining the target to) the benchmark CPUs.
+        let cpu_ids = if system_wide {
+            env_cpu_list()?.unwrap_or_else(online_cpus)
+        } else {
+            online_cpus()
+        };
         let cpu_count = cpu_ids.len();
         for &cpu in &cpu_ids {
             let perf = open_perf(pid, Some(cpu))?;

@@ -243,6 +243,29 @@ fn parse_u32(value: &str) -> Option<u32> {
     parse_u64(value)?.try_into().ok()
 }
 
+/// Fixed sample period from `SAMPLY_SAMPLE_PERIOD`, overriding the default
+/// frequency-based sampling for every sampling event when set (see
+/// `PerfBuilder::open`).
+fn env_sample_period() -> io::Result<Option<u64>> {
+    let spec = match std::env::var("SAMPLY_SAMPLE_PERIOD") {
+        Ok(spec) => spec,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SAMPLY_SAMPLE_PERIOD is not valid UTF-8",
+            ));
+        }
+    };
+    match parse_u64(&spec).filter(|&period| period > 0) {
+        Some(period) => Ok(Some(period)),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid SAMPLY_SAMPLE_PERIOD value '{spec}': expected a positive integer"),
+        )),
+    }
+}
+
 impl ExtraEvent {
     /// The `perf_event_attr` for opening this event as a counting-only sibling
     /// in the group of a leader opened with `leader_attr`.
@@ -444,12 +467,20 @@ impl PerfBuilder {
         //     start_disabled
         // );
 
+        // SAMPLY_SAMPLE_PERIOD pins every sampling event to a fixed period
+        // instead of the kernel's dynamic frequency-based one (see `attr.flags`
+        // below): each sample fires every N events with no per-tick period
+        // rewrite, at the cost of not adapting to a changing IPC.
+        let fixed_sample_period = env_sample_period()?;
+
         let max_sample_rate = Perf::max_sample_rate();
-        if let Some(max_sample_rate) = max_sample_rate {
-            // debug!("Maximum sample rate: {}", max_sample_rate);
-            if frequency > max_sample_rate {
-                let message = format!( "frequency can be at most {max_sample_rate} as configured in /proc/sys/kernel/perf_event_max_sample_rate" );
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        if fixed_sample_period.is_none() {
+            if let Some(max_sample_rate) = max_sample_rate {
+                // debug!("Maximum sample rate: {}", max_sample_rate);
+                if frequency > max_sample_rate {
+                    let message = format!( "frequency can be at most {max_sample_rate} as configured in /proc/sys/kernel/perf_event_max_sample_rate" );
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+                }
             }
         }
 
@@ -515,7 +546,7 @@ impl PerfBuilder {
 
         attr.sample_regs_user = reg_mask;
         attr.sample_stack_user = stack_size;
-        attr.sample_period_or_freq = frequency;
+        attr.sample_period_or_freq = fixed_sample_period.unwrap_or(frequency);
         attr.clock_id = libc::CLOCK_MONOTONIC;
 
         attr.flags = PERF_ATTR_FLAG_DISABLED
@@ -523,10 +554,13 @@ impl PerfBuilder {
             | PERF_ATTR_FLAG_MMAP2
             | PERF_ATTR_FLAG_MMAP_DATA
             | PERF_ATTR_FLAG_COMM
-            | PERF_ATTR_FLAG_FREQ
             | PERF_ATTR_FLAG_TASK
             | PERF_ATTR_FLAG_SAMPLE_ID_ALL
             | PERF_ATTR_FLAG_USE_CLOCKID;
+
+        if fixed_sample_period.is_none() {
+            attr.flags |= PERF_ATTR_FLAG_FREQ;
+        }
 
         if self.enable_on_exec {
             attr.flags |= PERF_ATTR_FLAG_ENABLE_ON_EXEC;
