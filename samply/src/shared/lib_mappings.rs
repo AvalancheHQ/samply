@@ -114,13 +114,13 @@ impl LibMappingsHierarchy {
     }
 
     pub fn convert_address(&self, address: u64) -> Option<(u32, &LibMappingInfo)> {
-        if let Some(x) = self.regular_libs.0.convert_address(address) {
-            return Some(x);
-        }
         for (mappings, _ops) in &self.jitdumps {
             if let Some(x) = mappings.convert_address(address) {
                 return Some(x);
             }
+        }
+        if let Some(x) = self.regular_libs.0.convert_address(address) {
+            return Some(x);
         }
         if let Some(perf_map) = &self.perf_map {
             if let Some(x) = perf_map.convert_address(address) {
@@ -222,4 +222,74 @@ pub struct LibMappingMove {
 #[derive(Debug, Clone)]
 pub struct LibMappingRemove {
     pub start_avma: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use debugid::DebugId;
+    use fxprof_processed_profile::{LibraryInfo, Profile, ReferenceTimestamp, SamplingInterval};
+
+    use super::*;
+
+    fn add_library(profile: &mut Profile, name: &str) -> LibraryHandle {
+        profile.add_lib(LibraryInfo {
+            name: name.into(),
+            debug_name: name.into(),
+            path: name.into(),
+            debug_path: name.into(),
+            debug_id: DebugId::nil(),
+            code_id: None,
+            arch: None,
+        })
+    }
+
+    fn add_mapping(
+        queue: &mut LibMappingOpQueue,
+        timestamp: u64,
+        start_avma: u64,
+        end_avma: u64,
+        lib_handle: LibraryHandle,
+    ) {
+        queue.push(
+            timestamp,
+            LibMappingOp::Add(LibMappingAdd {
+                start_avma,
+                end_avma,
+                relative_address_at_start: 0,
+                info: LibMappingInfo::new_lib(lib_handle),
+            }),
+        );
+    }
+
+    #[test]
+    fn timestamped_jit_mapping_overrides_regular_mapping() {
+        let mut profile = Profile::new(
+            "test",
+            ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
+            SamplingInterval::from_millis(1),
+        );
+        let regular = add_library(&mut profile, "regular");
+        let jit = add_library(&mut profile, "jit");
+
+        let mut regular_ops = LibMappingOpQueue::default();
+        add_mapping(&mut regular_ops, 0, 0x1000, 0x3000, regular);
+        let mut jit_ops = LibMappingOpQueue::default();
+        add_mapping(&mut jit_ops, 10, 0x1800, 0x1900, jit);
+
+        let mut hierarchy = LibMappingsHierarchy::new(regular_ops);
+        hierarchy.add_jitdump_lib_mappings_ops(jit_ops);
+
+        hierarchy.process_ops(9);
+        assert_eq!(
+            hierarchy.convert_address(0x1850).unwrap().1.lib_handle,
+            regular
+        );
+
+        hierarchy.process_ops(10);
+        assert_eq!(hierarchy.convert_address(0x1850).unwrap().1.lib_handle, jit);
+        assert_eq!(
+            hierarchy.convert_address(0x2000).unwrap().1.lib_handle,
+            regular
+        );
+    }
 }
